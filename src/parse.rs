@@ -1,7 +1,7 @@
 use jiff::civil::DateTime;
 
 use crate::date::{self, Due};
-use crate::task::Priority;
+use crate::task::{Priority, Task};
 
 /// What `add` reads out of its words.
 #[derive(Debug, PartialEq, Eq)]
@@ -19,6 +19,36 @@ pub struct Parsed {
 /// lowercased and kept once each; the last priority wins. A lone `+` or `!`, or
 /// `!` not followed by a letter (`!!`), stays in the title.
 pub fn parse(words: &[String], now: DateTime) -> Result<Parsed, String> {
+    let parsed = read(words, now)?;
+    if parsed.title.is_empty() {
+        return Err("a task needs a title, not just a date, tags and a priority".into());
+    }
+    Ok(parsed)
+}
+
+/// Changes `task` by the words of `edit`, read as `parse` reads them: words
+/// left after the date, tags and priority replace its title, tags are added
+/// to its own, and a priority or a date replaces its own.
+pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), String> {
+    let p = read(words, now)?;
+    if p.title.is_empty() && p.tags.is_empty() && p.priority.is_none() && p.due.is_none() {
+        return Err("nothing to change: give a new title, a date, +tags or a !priority".into());
+    }
+    if !p.title.is_empty() {
+        task.title = p.title;
+    }
+    for tag in p.tags {
+        if !task.tags.contains(&tag) {
+            task.tags.push(tag);
+        }
+    }
+    task.priority = p.priority.or(task.priority);
+    task.due = p.due.or(task.due);
+    Ok(())
+}
+
+/// `parse`'s reading, the title allowed empty.
+fn read(words: &[String], now: DateTime) -> Result<Parsed, String> {
     let mut title = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     let mut priority = None;
@@ -40,9 +70,6 @@ pub fn parse(words: &[String], now: DateTime) -> Result<Parsed, String> {
     }
 
     let (due, title) = date::read(&title, now)?;
-    if title.is_empty() {
-        return Err("a task needs a title, not just a date, tags and a priority".into());
-    }
     Ok(Parsed {
         title: title.join(" "),
         tags,
@@ -164,5 +191,49 @@ mod tests {
         assert!(parse(&words("+home !high")).is_err());
         assert!(parse(&["  ".to_string()]).is_err());
         assert!(parse(&words("tomorrow 9am +home")).is_err());
+    }
+
+    fn rent() -> Task {
+        Task {
+            id: 1,
+            title: "pay rent".into(),
+            status: crate::task::Status::Todo,
+            priority: Some(Priority::Low),
+            tags: vec!["home".into()],
+            due: Some("2026-11-20".parse().unwrap()),
+        }
+    }
+
+    /// `edit` as of Wednesday 2026-11-11, 10:30.
+    fn edit(task: &mut Task, s: &str) -> Result<(), String> {
+        super::edit(task, &words(s), date(2026, 11, 11).at(10, 30, 0, 0))
+    }
+
+    #[test]
+    fn edit_without_a_title_keeps_the_title() {
+        let mut task = rent();
+        edit(&mut task, "friday 9am !high +money").unwrap();
+        assert_eq!(task.title, "pay rent");
+        assert_eq!(task.priority, Some(Priority::High));
+        assert_eq!(task.tags, ["home", "money"]);
+        assert_eq!(task.due.unwrap().to_string(), "2026-11-13 09:00");
+    }
+
+    #[test]
+    fn edit_with_words_replaces_the_title_and_keeps_the_rest() {
+        let mut task = rent();
+        edit(&mut task, "pay the rent +Home").unwrap();
+        assert_eq!(task.title, "pay the rent");
+        assert_eq!(task.tags, ["home"]);
+        assert_eq!(task.priority, Some(Priority::Low));
+        assert_eq!(task.due, rent().due);
+    }
+
+    #[test]
+    fn edit_with_nothing_to_change_is_an_error_and_changes_nothing() {
+        let mut task = rent();
+        assert!(edit(&mut task, " ").is_err());
+        assert!(edit(&mut task, "x today tomorrow").is_err());
+        assert_eq!(task, rent());
     }
 }

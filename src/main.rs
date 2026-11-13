@@ -83,7 +83,10 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::List => {
             let color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
-            print!("{}", list::render(&tasks, jiff::Zoned::now().datetime(), color));
+            print!(
+                "{}",
+                list::render(&tasks, jiff::Zoned::now().datetime(), color)
+            );
         }
         Command::Done { id } => {
             let task = find(&mut tasks, id)?;
@@ -102,8 +105,24 @@ fn run(command: Command) -> Result<(), String> {
             store::save(&path, &tasks)?;
             println!("Removed {removed}");
         }
-        Command::Start { .. } => return Err("`start` isn't written yet".into()),
-        Command::Edit { .. } => return Err("`edit` isn't written yet".into()),
+        Command::Start { id } => {
+            let task = find(&mut tasks, id)?;
+            if task.status == Status::Doing {
+                println!("Already started {task}");
+                return Ok(());
+            }
+            task.status = Status::Doing;
+            let started = task.to_string();
+            store::save(&path, &tasks)?;
+            println!("Started {started}");
+        }
+        Command::Edit { id, words } => {
+            let task = find(&mut tasks, id)?;
+            parse::edit(task, &words, jiff::Zoned::now().datetime())?;
+            let edited = task.to_string();
+            store::save(&path, &tasks)?;
+            println!("Changed {edited}");
+        }
         Command::Board => board::run(&path, tasks)?,
     }
     Ok(())
