@@ -83,7 +83,7 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::List => {
             let color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
-            print!("{}", list::render(&tasks, color));
+            print!("{}", list::render(&tasks, jiff::Zoned::now().datetime(), color));
         }
         Command::Done { id } => {
             let task = find(&mut tasks, id)?;

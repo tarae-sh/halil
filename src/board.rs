@@ -204,7 +204,16 @@ impl Board {
         let mut ids: Vec<usize> = (0..self.tasks.len())
             .filter(|&i| self.tasks[i].status == COLUMNS[c])
             .collect();
-        ids.sort_by_key(|&i| (Reverse(self.tasks[i].priority), self.tasks[i].id));
+        if COLUMNS[c] == Status::Done {
+            ids.sort_by_key(|&i| (Reverse(self.tasks[i].priority), self.tasks[i].id));
+        } else {
+            // As the list does: soonest due first (so late ones lead), undated
+            // after, then highest priority, then oldest.
+            ids.sort_by_key(|&i| {
+                let t = &self.tasks[i];
+                (t.due.is_none(), t.due, Reverse(t.priority), t.id)
+            });
+        }
         ids
     }
 
