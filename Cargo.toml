@@ -2,7 +2,13 @@
 name = "halil"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "A small task manager for the terminal"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tarae-sh/halil"
+readme = "README.md"
+keywords = ["todo", "tasks", "cli", "tui"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
