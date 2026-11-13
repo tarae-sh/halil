@@ -82,7 +82,9 @@ impl fmt::Display for Task {
 /// The id a new task gets: the smallest number from 1 up that no task has.
 pub fn next_id(tasks: &[Task]) -> u32 {
     let used: HashSet<u32> = tasks.iter().map(|t| t.id).collect();
-    (1..).find(|id| !used.contains(id)).expect("fewer than u32::MAX tasks")
+    (1..)
+        .find(|id| !used.contains(id))
+        .expect("fewer than u32::MAX tasks")
 }
 
 #[cfg(test)]
@@ -108,7 +110,10 @@ mod tests {
         task.title = "pay rent".into();
         task.priority = Some(Priority::High);
         task.due = Some("2026-11-13 09:00".parse().unwrap());
-        assert_eq!(task.to_string(), "3: pay rent !high due Fri 2026-11-13 09:00");
+        assert_eq!(
+            task.to_string(),
+            "3: pay rent !high due Fri 2026-11-13 09:00"
+        );
     }
 
     #[test]

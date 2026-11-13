@@ -11,9 +11,18 @@ pub fn render(tasks: &[Task], color: bool) -> String {
     open.sort_by_key(|t| (Reverse(t.priority), t.id));
 
     let paint = |code: &str, s: String| -> String {
-        if color { format!("\x1b[{code}m{s}\x1b[0m") } else { s }
+        if color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s
+        }
     };
-    let id_width = open.iter().map(|t| t.id.to_string().len()).max().unwrap_or(0).max(2);
+    let id_width = open
+        .iter()
+        .map(|t| t.id.to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max(2);
 
     let mut out = paint("2", format!("{:>id_width$}  {:<4}  TASK", "ID", "PRI")) + "\n";
     for t in open {
@@ -21,7 +30,11 @@ pub fn render(tasks: &[Task], color: bool) -> String {
             Some(p) => paint(priority_color(p), format!("{p:<4}")),
             None => " ".repeat(4),
         };
-        let mut line = format!("{}  {pri}  {}", paint("2", format!("{:>id_width$}", t.id)), t.title);
+        let mut line = format!(
+            "{}  {pri}  {}",
+            paint("2", format!("{:>id_width$}", t.id)),
+            t.title
+        );
         if !t.tags.is_empty() {
             let tags: Vec<String> = t.tags.iter().map(|tag| format!("+{tag}")).collect();
             line += "  ";

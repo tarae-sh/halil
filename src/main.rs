@@ -109,7 +109,10 @@ fn run(command: Command) -> Result<(), String> {
 }
 
 fn position(tasks: &[Task], id: u32) -> Result<usize, String> {
-    tasks.iter().position(|t| t.id == id).ok_or_else(|| format!("there's no task {id}"))
+    tasks
+        .iter()
+        .position(|t| t.id == id)
+        .ok_or_else(|| format!("there's no task {id}"))
 }
 
 fn find(tasks: &mut [Task], id: u32) -> Result<&mut Task, String> {

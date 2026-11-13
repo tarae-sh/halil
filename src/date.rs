@@ -56,7 +56,9 @@ impl Serialize for Due {
 
 impl<'de> Deserialize<'de> for Due {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -108,7 +110,11 @@ pub fn read<'a>(words: &[&'a str], now: DateTime) -> Result<(Option<Due>, Vec<&'
             time: time.map(|(t, _)| t),
         }),
         (None, Some((t, phrase))) => {
-            let date = if t > now.time() { Ok(now.date()) } else { now.date().tomorrow() };
+            let date = if t > now.time() {
+                Ok(now.date())
+            } else {
+                now.date().tomorrow()
+            };
             Some(Due {
                 date: date.map_err(|e| format!("`{phrase}`: {e}"))?,
                 time: Some(t),
@@ -126,9 +132,16 @@ enum Piece {
 }
 
 /// Fills `slot` with what `phrase` read, unless an earlier phrase did.
-fn set<T>(slot: &mut Option<(T, String)>, value: T, phrase: &str, what: &str) -> Result<(), String> {
+fn set<T>(
+    slot: &mut Option<(T, String)>,
+    value: T,
+    phrase: &str,
+    what: &str,
+) -> Result<(), String> {
     if let Some((_, first)) = slot {
-        return Err(format!("`{first}` and `{phrase}` both give the {what}: give one"));
+        return Err(format!(
+            "`{first}` and `{phrase}` both give the {what}: give one"
+        ));
     }
     *slot = Some((value, phrase.to_string()));
     Ok(())
@@ -157,8 +170,11 @@ fn piece(w: &[&str], now: DateTime) -> Result<Option<(Piece, usize)>, String> {
 
     // friday: the soonest, today included
     if let Some(wd) = weekday(first) {
-        let ahead = (wd.to_monday_zero_offset() - today.weekday().to_monday_zero_offset()).rem_euclid(7);
-        let date = today.checked_add(Span::new().days(ahead)).map_err(too_far(1))?;
+        let ahead =
+            (wd.to_monday_zero_offset() - today.weekday().to_monday_zero_offset()).rem_euclid(7);
+        let date = today
+            .checked_add(Span::new().days(ahead))
+            .map_err(too_far(1))?;
         return Ok(Some((Piece::Day(date), 1)));
     }
 
@@ -167,7 +183,9 @@ fn piece(w: &[&str], now: DateTime) -> Result<Option<(Piece, usize)>, String> {
         && let Some(wd) = second.and_then(weekday)
     {
         let ahead = 7 - today.weekday().to_monday_zero_offset() + wd.to_monday_zero_offset();
-        let date = today.checked_add(Span::new().days(ahead)).map_err(too_far(2))?;
+        let date = today
+            .checked_add(Span::new().days(ahead))
+            .map_err(too_far(2))?;
         return Ok(Some((Piece::Day(date), 2)));
     }
 
@@ -177,14 +195,22 @@ fn piece(w: &[&str], now: DateTime) -> Result<Option<(Piece, usize)>, String> {
         && let Some(&unit) = w.get(2)
     {
         let piece = match unit {
-            "day" | "days" => Span::new().try_days(n).and_then(|s| today.checked_add(s)).map(Piece::Day),
-            "week" | "weeks" => Span::new().try_weeks(n).and_then(|s| today.checked_add(s)).map(Piece::Day),
-            "hour" | "hours" | "hr" | "hrs" => {
-                Span::new().try_hours(n).and_then(|s| now.checked_add(s)).map(Piece::Both)
-            }
-            "minute" | "minutes" | "min" | "mins" => {
-                Span::new().try_minutes(n).and_then(|s| now.checked_add(s)).map(Piece::Both)
-            }
+            "day" | "days" => Span::new()
+                .try_days(n)
+                .and_then(|s| today.checked_add(s))
+                .map(Piece::Day),
+            "week" | "weeks" => Span::new()
+                .try_weeks(n)
+                .and_then(|s| today.checked_add(s))
+                .map(Piece::Day),
+            "hour" | "hours" | "hr" | "hrs" => Span::new()
+                .try_hours(n)
+                .and_then(|s| now.checked_add(s))
+                .map(Piece::Both),
+            "minute" | "minutes" | "min" | "mins" => Span::new()
+                .try_minutes(n)
+                .and_then(|s| now.checked_add(s))
+                .map(Piece::Both),
             _ => return Ok(None),
         };
         return Ok(Some((piece.map_err(too_far(3))?, 3)));
@@ -198,7 +224,9 @@ fn piece(w: &[&str], now: DateTime) -> Result<Option<(Piece, usize)>, String> {
     // nov 20, 20 nov: the soonest, today included
     let month_day = match (month(first), second.and_then(day_of_month)) {
         (Some(m), Some(d)) => Some((m, d)),
-        _ => day_of_month(first).zip(second.and_then(month)).map(|(d, m)| (m, d)),
+        _ => day_of_month(first)
+            .zip(second.and_then(month))
+            .map(|(d, m)| (m, d)),
     };
     if let Some((m, d)) = month_day {
         let date = (today.year()..today.year().saturating_add(8))
@@ -211,7 +239,13 @@ fn piece(w: &[&str], now: DateTime) -> Result<Option<(Piece, usize)>, String> {
     // 2026-11-20, 2026-11-20t09:00
     let b = first.as_bytes();
     let iso_date = b.len() >= 10
-        && b[..10].iter().enumerate().all(|(i, c)| if i == 4 || i == 7 { *c == b'-' } else { c.is_ascii_digit() });
+        && b[..10].iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        });
     if iso_date {
         let bad = |e| format!("`{first}` isn't a date: {e}");
         if b.len() == 10 {
@@ -259,7 +293,14 @@ fn clock(first: &str, second: Option<&str>) -> Result<Option<(Time, usize)>, Str
     };
     match hour {
         Some(hour) if m <= 59 => Ok(Some((hm(hour, m)?, len))),
-        _ => Err(format!("`{}` isn't a time", if len == 2 { format!("{first} {}", second.unwrap()) } else { first.to_string() })),
+        _ => Err(format!(
+            "`{}` isn't a time",
+            if len == 2 {
+                format!("{first} {}", second.unwrap())
+            } else {
+                first.to_string()
+            }
+        )),
     }
 }
 
@@ -274,7 +315,10 @@ fn count(s: &str) -> Option<i64> {
 
 /// `20`, `20th`, `1st`.
 fn day_of_month(s: &str) -> Option<i8> {
-    let d = ["st", "nd", "rd", "th"].iter().find_map(|end| s.strip_suffix(end)).unwrap_or(s);
+    let d = ["st", "nd", "rd", "th"]
+        .iter()
+        .find_map(|end| s.strip_suffix(end))
+        .unwrap_or(s);
     if (1..=2).contains(&d.len()) && d.bytes().all(|c| c.is_ascii_digit()) {
         d.parse().ok()
     } else {
@@ -390,7 +434,11 @@ mod tests {
             ("2027-01-15 14:30", "2027-01-15 14:30", ""),
             // with a title
             ("pay rent friday 9am", "2026-11-13 09:00", "pay rent"),
-            ("9am call the bank tomorrow", "2026-11-12 09:00", "call the bank"),
+            (
+                "9am call the bank tomorrow",
+                "2026-11-12 09:00",
+                "call the bank",
+            ),
             ("call mum by tomorrow", "2026-11-12", "call mum"),
             ("standup at 9am on friday", "2026-11-13 09:00", "standup"),
             ("Report due nov 20", "2026-11-20", "Report"),
@@ -410,7 +458,11 @@ mod tests {
         for (words, due, rest) in table {
             let (got_due, got_rest) = read_str(words).unwrap_or_else(|e| panic!("{words:?}: {e}"));
             let got_due = got_due.map(|d| d.to_string()).unwrap_or_default();
-            assert_eq!((got_due.as_str(), got_rest.as_str()), (due, rest), "{words:?}");
+            assert_eq!(
+                (got_due.as_str(), got_rest.as_str()),
+                (due, rest),
+                "{words:?}"
+            );
         }
     }
 
@@ -446,7 +498,10 @@ mod tests {
             let due: Due = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&due).unwrap(), json);
         }
-        assert_eq!("2026-11-20 09:00".parse::<Due>().unwrap().to_string(), "2026-11-20 09:00");
+        assert_eq!(
+            "2026-11-20 09:00".parse::<Due>().unwrap().to_string(),
+            "2026-11-20 09:00"
+        );
         assert!("2026-11-31".parse::<Due>().is_err());
     }
 }
