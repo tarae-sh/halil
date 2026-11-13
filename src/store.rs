@@ -78,6 +78,7 @@ mod tests {
                 status: Status::Todo,
                 priority: None,
                 tags: vec![],
+                due: None,
             },
             Task {
                 id: 2,
@@ -85,6 +86,7 @@ mod tests {
                 status: Status::Done,
                 priority: Some(Priority::High),
                 tags: vec!["home".into(), "money".into()],
+                due: Some("2026-11-20T09:00".parse().unwrap()),
             },
         ]
     }
@@ -109,7 +111,7 @@ mod tests {
             concat!(
                 r#"{"id":1,"title":"buy milk","status":"todo"}"#,
                 "\n",
-                r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"]}"#,
+                r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"],"due":"2026-11-20T09:00"}"#,
                 "\n",
             )
         );

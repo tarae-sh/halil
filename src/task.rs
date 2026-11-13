@@ -4,6 +4,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::date::Due;
+
 /// One task: a line of the tasks file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
@@ -15,6 +17,8 @@ pub struct Task {
     pub priority: Option<Priority>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<Due>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +63,7 @@ impl fmt::Display for Priority {
 }
 
 impl fmt::Display for Task {
-    /// `3: pay rent +home !high`
+    /// `3: pay rent +home !high due Fri 2026-11-13 09:00`
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}: {}", self.id, self.title)?;
         for tag in &self.tags {
@@ -67,6 +71,9 @@ impl fmt::Display for Task {
         }
         if let Some(p) = self.priority {
             write!(f, " !{p}")?;
+        }
+        if let Some(due) = self.due {
+            write!(f, " due {} {due}", due.date.strftime("%a"))?;
         }
         Ok(())
     }
@@ -90,8 +97,18 @@ mod tests {
                 status: Status::Todo,
                 priority: None,
                 tags: vec![],
+                due: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn display_shows_the_due_date() {
+        let mut task = with_ids(&[3]).remove(0);
+        task.title = "pay rent".into();
+        task.priority = Some(Priority::High);
+        task.due = Some("2026-11-13 09:00".parse().unwrap());
+        assert_eq!(task.to_string(), "3: pay rent !high due Fri 2026-11-13 09:00");
     }
 
     #[test]

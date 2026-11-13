@@ -52,6 +52,7 @@ mod tests {
             status,
             priority,
             tags: vec![],
+            due: None,
         }
     }
 

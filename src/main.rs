@@ -1,3 +1,4 @@
+mod date;
 mod list;
 mod parse;
 mod store;
@@ -65,13 +66,14 @@ fn run(command: Command) -> Result<(), String> {
 
     match command {
         Command::Add { words } => {
-            let parsed = parse::parse(&words)?;
+            let parsed = parse::parse(&words, jiff::Zoned::now().datetime())?;
             let task = Task {
                 id: task::next_id(&tasks),
                 title: parsed.title,
                 status: Status::Todo,
                 priority: parsed.priority,
                 tags: parsed.tags,
+                due: parsed.due,
             };
             let added = task.to_string();
             tasks.push(task);
