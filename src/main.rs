@@ -1,3 +1,4 @@
+mod board;
 mod date;
 mod list;
 mod parse;
@@ -103,7 +104,7 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::Start { .. } => return Err("`start` isn't written yet".into()),
         Command::Edit { .. } => return Err("`edit` isn't written yet".into()),
-        Command::Board => return Err("`board` isn't written yet".into()),
+        Command::Board => board::run(&path, tasks)?,
     }
     Ok(())
 }
