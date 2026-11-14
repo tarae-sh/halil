@@ -8,15 +8,18 @@ board shows them as Todo, Doing and Done.
 halil was built from an empty folder in one sitting with Claude in [tarae](https://github.com/tarae-sh/tarae).
 Halfway, two Claudes worked side by side, each in its own checkout of this repository, and every change waited for
 a yes before it was kept. Watch it in eleven minutes:
-[Building a task manager with Claude, two at once](https://youtu.be/_GRlIMMMTmk).
+[Building a task manager with Claude, two at once](https://youtu.be/_GRlIMMMTmk). `start` and `edit` were written
+after the sitting.
 
 ## Install
 
 You need Rust 1.85 or newer.
 
 ```sh
-cargo install --git https://github.com/tarae-sh/halil
+cargo install halil
 ```
+
+Or the latest from this repository: `cargo install --git https://github.com/tarae-sh/halil`.
 
 ## Use
 
