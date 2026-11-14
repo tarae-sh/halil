@@ -3,7 +3,7 @@
 A small task manager for the terminal. You write tasks in plain words, the list puts what's due first, and a
 board shows them as Todo, Doing and Done.
 
-![halil board: Todo, Doing and Done columns, each card its title, its tags and its due date in words](docs/board.png)
+![halil board: Todo, Doing and Done columns, each card its title, its tags and its due date in words](https://raw.githubusercontent.com/tarae-sh/halil/main/docs/board.png)
 
 halil was built from an empty folder in one sitting with Claude in [tarae](https://github.com/tarae-sh/tarae).
 Halfway, two Claudes worked side by side, each in its own checkout of this repository, and every change waited for

@@ -9,6 +9,8 @@ repository = "https://github.com/tarae-sh/halil"
 readme = "README.md"
 keywords = ["todo", "tasks", "cli", "tui"]
 categories = ["command-line-utilities"]
+# The README's picture is linked by its URL: the crate needn't carry it.
+exclude = ["docs/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
