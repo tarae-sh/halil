@@ -135,7 +135,12 @@ fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said
                 false => format!("Done {}\n", tasks[i]),
             };
             if !open.is_empty() {
-                text += &task::done_with(open.len(), false);
+                text += &match (was_done, open.len()) {
+                    // Done already: only its sub items are done now.
+                    (true, 1) => "Its 1 open sub item is done now.".into(),
+                    (true, n) => format!("Its {n} open sub items are done now."),
+                    (false, n) => task::done_with(n, false),
+                };
                 text.push('\n');
             }
             said(text, !was_done || !open.is_empty())
@@ -322,6 +327,30 @@ mod tests {
         assert!(!said.changed);
         let said = run(Command::Done { id: 4 }, &mut tasks).unwrap();
         assert_eq!(said.text, "Done 4: buy milk\n");
+    }
+
+    #[test]
+    fn done_on_a_done_task_says_its_open_sub_items_are_done_now() {
+        // Done already, with sub items open under it (`halil sub` after it
+        // was done, say): only they change.
+        let mut tasks = ship();
+        tasks[0].status = Status::Done;
+        let said = run(Command::Done { id: 3 }, &mut tasks).unwrap();
+        assert_eq!(
+            said.text,
+            "Already done 3: ship 0.2.0\nIts 2 open sub items are done now.\n"
+        );
+        assert!(said.changed);
+        assert!(tasks.iter().all(|t| t.id == 4 || t.status == Status::Done));
+
+        let mut tasks = ship();
+        tasks[0].status = Status::Done;
+        tasks[4].status = Status::Done;
+        let said = run(Command::Done { id: 3 }, &mut tasks).unwrap();
+        assert_eq!(
+            said.text,
+            "Already done 3: ship 0.2.0\nIts 1 open sub item is done now.\n"
+        );
     }
 
     #[test]

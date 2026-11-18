@@ -377,11 +377,11 @@ impl Board {
             } => {
                 // The card it was typed under may have gone meanwhile (a `halil
                 // rm` elsewhere): it's a task of its own then, never one under
-                // a gone id, which `next_id` could hand to itself.
+                // a gone id, which `next_id` could hand to itself. The add
+                // happens, another way: a note, not a refusal.
                 let parent = match parent {
                     Some(p) if self.index(p).is_none() => {
-                        self.message =
-                            Some(format!("task {p} is gone: added as a task of its own"));
+                        self.note = Some(format!("{p} is gone: added as a task of its own."));
                         None
                     }
                     parent => parent,
@@ -2667,9 +2667,17 @@ mod tests {
             "its own task, not one under itself"
         );
         assert_eq!(
-            board.message.as_deref(),
-            Some("task 2 is gone: added as a task of its own")
+            board.note.as_deref(),
+            Some("2 is gone: added as a task of its own."),
+            "the add happened, another way"
         );
+        assert_eq!(board.message, None, "not a refusal");
+        let (lines, _) = board.draw(100, 12);
+        let note = lines[10]
+            .iter()
+            .find(|s| s.text == "2 is gone: added as a task of its own.")
+            .unwrap();
+        assert_eq!(note.style.fg, None, "in the default foreground");
         // A card like any other: it takes sub items.
         assert_eq!(picked_id(&board), Some(2));
         press(&mut board, "A");
