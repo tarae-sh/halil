@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -19,6 +19,9 @@ pub struct Task {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<Due>,
+    /// The task this is a sub item of (see [`parents`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,12 +82,66 @@ impl fmt::Display for Task {
     }
 }
 
-/// The id a new task gets: the smallest number from 1 up that no task has.
+/// The id a new task gets: the smallest number from 1 up that no task has, nor
+/// names as its parent — so a sub item whose parent is gone never finds itself
+/// under a new task.
 pub fn next_id(tasks: &[Task]) -> u32 {
-    let used: HashSet<u32> = tasks.iter().map(|t| t.id).collect();
+    let used: HashSet<u32> = tasks
+        .iter()
+        .flat_map(|t| std::iter::once(t.id).chain(t.parent))
+        .collect();
     (1..)
         .find(|id| !used.contains(id))
         .expect("fewer than u32::MAX tasks")
+}
+
+/// Whether `task` is under another task that's there: such a task takes no
+/// sub items of its own, since they go one level deep.
+pub fn is_sub_item(tasks: &[Task], task: &Task) -> bool {
+    task.parent.is_some_and(|p| tasks.iter().any(|t| t.id == p))
+}
+
+/// For each task, the index in `tasks` of the card it's a sub item of, or
+/// `None` for a card. A task is a sub item when its parent is there and is no
+/// sub item itself; any other task is a card, so one whose parent is gone is
+/// shown as a card, never lost.
+pub fn parents(tasks: &[Task]) -> Vec<Option<usize>> {
+    let index: HashMap<u32, usize> = tasks.iter().enumerate().map(|(i, t)| (t.id, i)).collect();
+    tasks
+        .iter()
+        .map(|t| {
+            let p = *index.get(&t.parent?)?;
+            let grand = tasks[p].parent.is_some_and(|g| index.contains_key(&g));
+            (!grand).then_some(p)
+        })
+        .collect()
+}
+
+/// The sub items of the card at index `card`, in id order, as indices into the
+/// tasks `parents` was read from.
+pub fn sub_items(tasks: &[Task], parents: &[Option<usize>], card: usize) -> Vec<usize> {
+    let mut subs: Vec<usize> = (0..parents.len())
+        .filter(|&i| parents[i] == Some(card))
+        .collect();
+    subs.sort_by_key(|&i| tasks[i].id);
+    subs
+}
+
+/// `2/4`: how many of these sub items are done, of how many; none without any.
+pub fn progress(tasks: &[Task], subs: &[usize]) -> Option<String> {
+    let done = subs
+        .iter()
+        .filter(|&&i| tasks[i].status == Status::Done)
+        .count();
+    (!subs.is_empty()).then(|| format!("{done}/{}", subs.len()))
+}
+
+/// `1 sub item`, `3 sub items`: `n` of `noun`.
+pub fn count_of(n: usize, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
 }
 
 #[cfg(test)]
@@ -100,6 +157,7 @@ mod tests {
                 priority: None,
                 tags: vec![],
                 due: None,
+                parent: None,
             })
             .collect()
     }
@@ -122,5 +180,24 @@ mod tests {
         assert_eq!(next_id(&with_ids(&[1, 2, 3])), 4);
         assert_eq!(next_id(&with_ids(&[1, 2, 4])), 3);
         assert_eq!(next_id(&with_ids(&[5, 2, 3])), 1);
+    }
+
+    #[test]
+    fn next_id_skips_a_gone_parents_id() {
+        let mut tasks = with_ids(&[2]);
+        tasks[0].parent = Some(1);
+        assert_eq!(next_id(&tasks), 3);
+    }
+
+    #[test]
+    fn sub_items_go_one_level_deep_and_an_orphan_is_a_card() {
+        // 2 is under 1; 3 under 2, a sub item; 4 under 9, gone.
+        let mut tasks = with_ids(&[1, 2, 3, 4]);
+        tasks[1].parent = Some(1);
+        tasks[2].parent = Some(2);
+        tasks[3].parent = Some(9);
+        assert_eq!(parents(&tasks), [None, Some(0), None, None]);
+        assert!(is_sub_item(&tasks, &tasks[1]));
+        assert!(!is_sub_item(&tasks, &tasks[3]));
     }
 }

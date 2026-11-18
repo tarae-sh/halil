@@ -79,6 +79,7 @@ mod tests {
                 priority: None,
                 tags: vec![],
                 due: None,
+                parent: None,
             },
             Task {
                 id: 2,
@@ -87,6 +88,7 @@ mod tests {
                 priority: Some(Priority::High),
                 tags: vec!["home".into(), "money".into()],
                 due: Some("2026-11-20T09:00".parse().unwrap()),
+                parent: None,
             },
         ]
     }
@@ -157,6 +159,41 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, 7);
         assert_eq!(tasks[0].status, Status::Todo);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_sub_item_names_its_parent_and_a_file_from_0_1_0_loads() {
+        let dir = temp_dir("parent");
+        let path = dir.join("tasks.jsonl");
+        let mut tasks = sample();
+        tasks[1].parent = Some(1);
+        save(&path, &tasks).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(r#""status":"todo"}"#)
+        );
+        assert!(
+            text.lines().nth(1).unwrap().ends_with(r#","parent":1}"#),
+            "{text}"
+        );
+        assert_eq!(load(&path).unwrap(), tasks);
+
+        // Written by 0.1.0, before sub items: none has a parent.
+        fs::write(
+            &path,
+            concat!(
+                r#"{"id":1,"title":"buy milk","status":"todo"}"#,
+                "\n",
+                r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"],"due":"2026-11-20T09:00"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap(), sample());
         fs::remove_dir_all(dir).unwrap();
     }
 

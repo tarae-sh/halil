@@ -19,38 +19,83 @@ pub struct Parsed {
 /// lowercased and kept once each; the last priority wins. A lone `+` or `!`, or
 /// `!` not followed by a letter (`!!`), stays in the title.
 pub fn parse(words: &[String], now: DateTime) -> Result<Parsed, String> {
-    let parsed = read(words, now)?;
+    let (parsed, _) = read(words, now, |_| false)?;
     if parsed.title.is_empty() {
         return Err("a task needs a title, not just a date, tags and a priority".into());
     }
     Ok(parsed)
 }
 
-/// Changes `task` by the words of `edit`, read as `parse` reads them: words
-/// left after the date, tags and priority replace its title, tags are added
-/// to its own, and a priority or a date replaces its own.
-pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), String> {
-    let p = read(words, now)?;
-    if p.title.is_empty() && p.tags.is_empty() && p.priority.is_none() && p.due.is_none() {
-        return Err("nothing to change: give a new title, a date, +tags or a !priority".into());
-    }
-    if !p.title.is_empty() {
-        task.title = p.title;
-    }
-    for tag in p.tags {
-        if !task.tags.contains(&tag) {
-            task.tags.push(tag);
+/// What the words of `edit` change in a task.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Change {
+    /// A new title, when words are left after the rest is read out.
+    pub title: Option<String>,
+    /// Tags to add, and tags to take off.
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+    /// A priority or a date that replaces the task's own.
+    pub priority: Option<Priority>,
+    pub due: Option<Due>,
+}
+
+impl Change {
+    pub fn apply(&self, task: &mut Task) {
+        if let Some(title) = &self.title {
+            task.title.clone_from(title);
         }
+        for tag in &self.add {
+            if !task.tags.contains(tag) {
+                task.tags.push(tag.clone());
+            }
+        }
+        task.tags.retain(|t| !self.remove.contains(t));
+        task.priority = self.priority.or(task.priority);
+        task.due = self.due.or(task.due);
     }
-    task.priority = p.priority.or(task.priority);
-    task.due = p.due.or(task.due);
+}
+
+/// Reads the words of `edit` as `parse` reads them, and `-tag` too, which takes
+/// a tag off: it's read only when `has(tag)` says the task has it, else it
+/// stays in the title.
+pub fn change(
+    words: &[String],
+    now: DateTime,
+    has: impl Fn(&str) -> bool,
+) -> Result<Change, String> {
+    let (p, remove) = read(words, now, has)?;
+    Ok(Change {
+        title: Some(p.title).filter(|t| !t.is_empty()),
+        add: p.tags,
+        remove,
+        priority: p.priority,
+        due: p.due,
+    })
+}
+
+/// Changes `task` by the words of `edit` (see [`change`]): words left after the
+/// date, tags and priority replace its title, `+tags` are added to its own and
+/// `-tags` taken off, and a priority or a date replaces its own.
+pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), String> {
+    let change = change(words, now, |tag| task.tags.iter().any(|t| t == tag))?;
+    if change == Change::default() {
+        return Err(
+            "nothing to change: give a new title, a date, +tags, -tags or a !priority".into(),
+        );
+    }
+    change.apply(task);
     Ok(())
 }
 
-/// `parse`'s reading, the title allowed empty.
-fn read(words: &[String], now: DateTime) -> Result<Parsed, String> {
+/// `parse`'s reading, the title allowed empty, and the `-tags` that `has`.
+fn read(
+    words: &[String],
+    now: DateTime,
+    has: impl Fn(&str) -> bool,
+) -> Result<(Parsed, Vec<String>), String> {
     let mut title = Vec::new();
     let mut tags: Vec<String> = Vec::new();
+    let mut untags: Vec<String> = Vec::new();
     let mut priority = None;
 
     for word in words.iter().flat_map(|w| w.split_whitespace()) {
@@ -58,6 +103,14 @@ fn read(words: &[String], now: DateTime) -> Result<Parsed, String> {
             let tag = tag.to_lowercase();
             if !tags.contains(&tag) {
                 tags.push(tag);
+            }
+        } else if let Some(tag) = word
+            .strip_prefix('-')
+            .map(str::to_lowercase)
+            .filter(|t| !t.is_empty() && has(t))
+        {
+            if !untags.contains(&tag) {
+                untags.push(tag);
             }
         } else if let Some(p) = word
             .strip_prefix('!')
@@ -70,12 +123,13 @@ fn read(words: &[String], now: DateTime) -> Result<Parsed, String> {
     }
 
     let (due, title) = date::read(&title, now)?;
-    Ok(Parsed {
+    let parsed = Parsed {
         title: title.join(" "),
         tags,
         priority,
         due,
-    })
+    };
+    Ok((parsed, untags))
 }
 
 #[cfg(test)]
@@ -201,6 +255,7 @@ mod tests {
             priority: Some(Priority::Low),
             tags: vec!["home".into()],
             due: Some("2026-11-20".parse().unwrap()),
+            parent: None,
         }
     }
 
@@ -227,6 +282,23 @@ mod tests {
         assert_eq!(task.tags, ["home"]);
         assert_eq!(task.priority, Some(Priority::Low));
         assert_eq!(task.due, rent().due);
+    }
+
+    #[test]
+    fn minus_tag_takes_off_a_tag_the_task_has_and_is_a_title_word_otherwise() {
+        let mut task = rent();
+        task.tags.push("money".into());
+        edit(&mut task, "-Home").unwrap();
+        assert_eq!(task.tags, ["money"]);
+        assert_eq!(task.title, "pay rent");
+        edit(&mut task, "pay rent -work").unwrap();
+        assert_eq!(task.title, "pay rent -work");
+        assert_eq!(task.tags, ["money"]);
+        assert_eq!(
+            parse(&words("x -money")).unwrap().title,
+            "x -money",
+            "add has no tags to take off"
+        );
     }
 
     #[test]

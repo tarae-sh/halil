@@ -3,16 +3,35 @@ use std::cmp::Reverse;
 use jiff::civil::{DateTime, Time};
 
 use crate::date::Due;
-use crate::task::{Priority, Status, Task};
+use crate::task::{self, Priority, Status, Task};
 
 /// The open tasks as a table: soonest due first (so late ones lead), undated
-/// after, then highest priority, then oldest.
+/// after, then highest priority, then oldest. A task's open sub items come
+/// under it, indented, in id order, and how many of them are done after it.
 pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
-    let mut open: Vec<&Task> = tasks.iter().filter(|t| t.status != Status::Done).collect();
-    if open.is_empty() {
+    let parents = task::parents(tasks);
+    let mut cards: Vec<usize> = (0..tasks.len())
+        .filter(|&i| parents[i].is_none() && tasks[i].status != Status::Done)
+        .collect();
+    if cards.is_empty() {
         return "Nothing to do.\n".into();
     }
-    open.sort_by_key(|t| (t.due.is_none(), t.due, Reverse(t.priority), t.id));
+    cards.sort_by_key(|&i| {
+        let t = &tasks[i];
+        (t.due.is_none(), t.due, Reverse(t.priority), t.id)
+    });
+    // Each task, whether it's a sub item, and its sub items' count.
+    let mut open: Vec<(&Task, bool, Option<String>)> = Vec::new();
+    for i in cards {
+        let subs = task::sub_items(tasks, &parents, i);
+        open.push((&tasks[i], false, task::progress(tasks, &subs)));
+        for s in subs
+            .into_iter()
+            .filter(|&s| tasks[s].status != Status::Done)
+        {
+            open.push((&tasks[s], true, None));
+        }
+    }
 
     let paint = |code: &str, s: String| -> String {
         if color {
@@ -23,14 +42,14 @@ pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
     };
     let id_width = open
         .iter()
-        .map(|t| t.id.to_string().len())
+        .map(|(t, ..)| t.id.to_string().len())
         .max()
         .unwrap_or(0)
         .max(2);
     // The DUE column shows only when some task has a date.
     let due_width = open
         .iter()
-        .filter_map(|t| t.due.map(|d| due_words(d, now).0.len()))
+        .filter_map(|(t, ..)| t.due.map(|d| due_words(d, now).0.len()))
         .max()
         .map(|w| w.max(3));
 
@@ -40,7 +59,7 @@ pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
     }
     header += "TASK";
     let mut out = paint("2", header) + "\n";
-    for t in open {
+    for (t, sub, progress) in open {
         let pri = match t.priority {
             Some(p) => paint(priority_color(p), format!("{p:<4}")),
             None => " ".repeat(4),
@@ -56,7 +75,14 @@ pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
             };
             line += "  ";
         }
+        if sub {
+            line += "  ";
+        }
         line += &t.title;
+        if let Some(progress) = progress {
+            line += "  ";
+            line += &paint("2", progress);
+        }
         if !t.tags.is_empty() {
             let tags: Vec<String> = t.tags.iter().map(|tag| format!("+{tag}")).collect();
             line += "  ";
@@ -123,7 +149,45 @@ mod tests {
             priority,
             tags: vec![],
             due: None,
+            parent: None,
         }
+    }
+
+    fn sub(id: u32, title: &str, status: Status, parent: u32) -> Task {
+        Task {
+            parent: Some(parent),
+            ..task(id, title, None, status)
+        }
+    }
+
+    #[test]
+    fn sub_items_come_under_their_task_indented_with_the_count_after_it() {
+        let mut ship = task(3, "ship 0.2.0", Some(Priority::High), Status::Doing);
+        ship.tags = vec!["work".into()];
+        let mut tests = sub(6, "write the tests", Status::Todo, 3);
+        tests.priority = Some(Priority::Low);
+        let tasks = [
+            task(1, "buy milk", None, Status::Todo),
+            sub(7, "tag the release", Status::Doing, 3),
+            ship,
+            sub(5, "bump the version", Status::Done, 3),
+            tests,
+            // Its task is gone: a task of its own.
+            sub(8, "orphan", Status::Todo, 99),
+        ];
+        let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
+        assert_eq!(
+            render(&tasks, now, false),
+            concat!(
+                "ID  PRI   TASK\n",
+                " 3  high  ship 0.2.0  1/3  +work\n",
+                " 6  low     write the tests\n",
+                " 7          tag the release\n",
+                " 1        buy milk\n",
+                " 8        orphan\n",
+            )
+        );
+        assert!(render(&tasks, now, true).contains("ship 0.2.0  \x1b[2m1/3\x1b[0m"));
     }
 
     #[test]
