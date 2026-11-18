@@ -8,10 +8,13 @@ use crate::task::{self, Priority, Status, Task};
 /// The open tasks as a table: soonest due first (so late ones lead), undated
 /// after, then highest priority, then oldest. A task's open sub items come
 /// under it, indented, in id order, and how many of them are done after it.
+/// An open sub item whose task is done (as a hand-edited file may have it) is
+/// listed as a task of its own: no open task is left out.
 pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
     let parents = task::parents(tasks);
+    let under_open = |i: usize| parents[i].is_some_and(|p| tasks[p].status != Status::Done);
     let mut cards: Vec<usize> = (0..tasks.len())
-        .filter(|&i| parents[i].is_none() && tasks[i].status != Status::Done)
+        .filter(|&i| !under_open(i) && tasks[i].status != Status::Done)
         .collect();
     if cards.is_empty() {
         return "Nothing to do.\n".into();
@@ -188,6 +191,26 @@ mod tests {
             )
         );
         assert!(render(&tasks, now, true).contains("ship 0.2.0  \x1b[2m1/3\x1b[0m"));
+    }
+
+    #[test]
+    fn an_open_sub_item_whose_task_is_done_is_listed_as_a_task_of_its_own() {
+        // A hand-edited file: ship is done, write the tests isn't.
+        let tasks = [
+            task(1, "buy milk", None, Status::Todo),
+            task(3, "ship 0.2.0", Some(Priority::High), Status::Done),
+            sub(5, "bump the version", Status::Done, 3),
+            sub(6, "write the tests", Status::Doing, 3),
+        ];
+        let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
+        assert_eq!(
+            render(&tasks, now, false),
+            concat!(
+                "ID  PRI   TASK\n",
+                " 1        buy milk\n",
+                " 6        write the tests\n",
+            )
+        );
     }
 
     #[test]

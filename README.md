@@ -37,8 +37,9 @@ halil board
 
 A **sub item** is a task under another task, one level deep. It takes the words of `add` and an id of its own,
 so `done`, `start`, `edit` and `rm` work on it as on any task. The list shows a task's open sub items under it,
-and how many are done after it (`2/4`). `halil done` on a task finishes its open sub items too, and `halil rm`
-removes them. A task never finishes by itself when its last sub item does.
+and how many are done after it (`2/4`). A task that becomes done, by `halil done` or on the board (`d`, or `l`
+into Done), finishes its open sub items too, and moving it back out of Done reopens none; `halil rm` removes
+them. A task never finishes by itself when its last sub item does.
 
 
 `add` and `edit` read three things out of the words, and the rest is the title (`edit` keeps the old title when

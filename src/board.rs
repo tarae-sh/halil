@@ -163,10 +163,12 @@ pub enum Outcome {
 /// A change to the tasks, by id, so it can be made to the file as it is now.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Op {
-    /// Set a task's status; `follow` keeps it picked in its new column.
+    /// Set a task's status; `follow` keeps it picked in its new column. A card
+    /// set to Done finishes its open sub items.
     Move { id: u32, to: Status, follow: bool },
     /// Move each of these tasks a column left (-1) or right (1) of where it
-    /// is; one already at the edge stays.
+    /// is; one already at the edge stays. A card moved into Done finishes its
+    /// open sub items; one moved out of it reopens none.
     Shift { ids: Vec<u32>, by: isize },
     /// Mark each of these tasks done, and the open sub items of those that
     /// are cards.
@@ -306,6 +308,9 @@ impl Board {
                     Some(task) => task.status = to,
                     None => self.message = Some(format!("task {id} is gone")),
                 }
+                if to == Status::Done {
+                    self.finish_sub_items(&[id]);
+                }
                 if follow {
                     self.pick(id);
                 }
@@ -314,23 +319,29 @@ impl Board {
                 let picked = self.picked().map(|i| self.tasks[i].id);
                 // A sub item moves with its card, never by itself.
                 let parents = task::parents(&self.tasks);
+                let mut into_done = Vec::new();
                 for (task, parent) in self.tasks.iter_mut().zip(parents) {
                     if parent.is_none()
                         && ids.contains(&task.id)
                         && let Some(to) = shifted(task.status, by)
                     {
                         task.status = to;
+                        if to == Status::Done {
+                            into_done.push(task.id);
+                        }
                     }
                 }
+                self.finish_sub_items(&into_done);
                 if let Some(id) = picked {
                     self.pick(id);
                 }
             }
             Op::Finish { ids } => {
                 let picked = self.picked().map(|i| self.tasks[i].id);
-                for i in self.finishing(&ids) {
-                    self.tasks[i].status = Status::Done;
+                for task in self.tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
+                    task.status = Status::Done;
                 }
+                self.finish_sub_items(&ids);
                 if let Some(id) = picked {
                     self.repick(id, self.col);
                 }
@@ -349,6 +360,17 @@ impl Board {
                 task: parsed,
                 parent,
             } => {
+                // The card it was typed under may have gone meanwhile (a `halil
+                // rm` elsewhere): it's a task of its own then, never one under
+                // a gone id, which `next_id` could hand to itself.
+                let parent = match parent {
+                    Some(p) if self.index(p).is_none() => {
+                        self.message =
+                            Some(format!("task {p} is gone: added as a task of its own"));
+                        None
+                    }
+                    parent => parent,
+                };
                 let id = task::next_id(&self.tasks);
                 self.tasks.push(Task {
                     id,
@@ -374,6 +396,33 @@ impl Board {
             .filter(|&i| self.tasks[i].status != Status::Done)
             .filter(|&i| named(i) || parents[i].is_some_and(named))
             .collect()
+    }
+
+    /// Marks done the open sub items of those of `ids` that are cards, since
+    /// their card is now done, and says how many on the message row (after
+    /// what it says already).
+    fn finish_sub_items(&mut self, ids: &[u32]) {
+        let parents = task::parents(&self.tasks);
+        let mut cards = BTreeSet::new();
+        let mut n = 0;
+        for (i, parent) in parents.into_iter().enumerate() {
+            if let Some(p) = parent
+                && ids.contains(&self.tasks[p].id)
+                && self.tasks[i].status != Status::Done
+            {
+                self.tasks[i].status = Status::Done;
+                cards.insert(p);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            let whose = if cards.len() == 1 { "its" } else { "their" };
+            let said = format!("Done {whose} {} too", task::count_of(n, "open sub item"));
+            self.message = Some(match self.message.take() {
+                Some(m) => format!("{m}; {said}"),
+                None => said,
+            });
+        }
     }
 
     /// Whether `tasks[i]` is a sub item, shown under its card.
@@ -593,7 +642,20 @@ impl Board {
             _ => self.marked.iter().copied().collect(),
         };
         let tasks: Vec<&Task> = self.tasks.iter().filter(|t| ids.contains(&t.id)).collect();
-        let has = |tag: &str| tasks.iter().any(|t| t.tags.iter().any(|own| own == tag));
+        // `e` on one fills in its title, which is read again: a `-tag` that's
+        // a word of that title went in as one (the task hadn't the tag then),
+        // and stays one, or an untouched enter would take the tag off.
+        let in_title = |t: &Task, tag: &str| {
+            kind != InputKind::EditMarked
+                && t.title
+                    .split_whitespace()
+                    .any(|w| w.strip_prefix('-').is_some_and(|w| w.to_lowercase() == tag))
+        };
+        let has = |tag: &str| {
+            tasks
+                .iter()
+                .any(|t| t.tags.iter().any(|own| own == tag) && !in_title(t, tag))
+        };
         let change = match parse::change(words, now, has) {
             Ok(change) => change,
             Err(e) => {
@@ -750,39 +812,38 @@ impl Board {
                     &truncate(&format!("  {} marked", self.marked.len()), w),
                     Style::default(),
                 );
-                for (keys, what) in [
-                    ("h l", "move"),
-                    ("e", "edit"),
-                    ("d", "done"),
-                    ("esc", "clear"),
-                ] {
-                    if footer.width + 3 + keys.len() + 1 + what.len() > w {
-                        break;
-                    }
+                // `esc clear` gives way first, then `e`, then `h l`; `d` never.
+                let hints = [
+                    ("h l", "move", Some(3)),
+                    ("e", "edit", Some(2)),
+                    ("d", "done", None),
+                    ("esc", "clear", Some(1)),
+                ];
+                for (keys, what) in giving_way(&hints, w.saturating_sub(footer.width), 4) {
                     footer.push("   ", Style::default());
                     footer.push(keys, Style::fg(QUIET));
                     footer.push(&format!(" {what}"), Style::fg(QUIETER));
                 }
             }
             None => {
-                // The keys most needed first: past 80 columns `q quit` gives
-                // way (as does `esc`, it quits).
+                // When they don't all fit, the keys give way by need: `tab`
+                // first (the arrows go between columns too), then `q` (`esc`
+                // quits too), then `j k`, and only then the rest. `d` never
+                // goes, nor its word for what it does to the picked row.
                 let sub = self.picked().is_some_and(|i| parents[i].is_some());
                 footer.push(" ", Style::default());
-                for (keys, what) in [
-                    ("j k", "pick"),
-                    ("space", "mark"),
-                    ("h l", "move"),
-                    ("tab", "column"),
-                    ("a", "add"),
-                    ("A", "sub"),
-                    ("e", "edit"),
-                    ("d", if sub { "done/open" } else { "done" }),
-                    ("q", "quit"),
-                ] {
-                    if footer.width + 3 + keys.len() + what.len() > w {
-                        break;
-                    }
+                let hints = [
+                    ("j k", "pick", Some(3)),
+                    ("space", "mark", Some(5)),
+                    ("h l", "move", Some(8)),
+                    ("tab", "column", Some(1)),
+                    ("a", "add", Some(7)),
+                    ("A", "sub", Some(4)),
+                    ("e", "edit", Some(6)),
+                    ("d", if sub { "done/open" } else { "done" }, None),
+                    ("q", "quit", Some(2)),
+                ];
+                for (keys, what) in giving_way(&hints, w.saturating_sub(footer.width), 3) {
                     footer.push(&format!(" {keys} "), Style::fg(QUIET));
                     footer.push(&format!("{what} "), Style::fg(QUIETER));
                 }
@@ -791,6 +852,37 @@ impl Board {
         lines.push(footer.spans);
         (lines, cursor)
     }
+}
+
+/// The footer's key hints that fit in `room` columns, in their order, each
+/// taking `extra` columns besides its key and its word. When they don't all
+/// fit, they give way by their rank, the lowest first; one ranked `None` never
+/// does. What still doesn't fit is left off the end.
+fn giving_way<'a>(
+    hints: &[(&'a str, &'a str, Option<u8>)],
+    room: usize,
+    extra: usize,
+) -> Vec<(&'a str, &'a str)> {
+    let width = |&(keys, what, _): &(&str, &str, Option<u8>)| extra + keys.width() + what.width();
+    let mut shown = hints.to_vec();
+    while shown.iter().map(width).sum::<usize>() > room {
+        let Some(next) = (0..shown.len())
+            .filter(|&i| shown[i].2.is_some())
+            .min_by_key(|&i| shown[i].2)
+        else {
+            break;
+        };
+        shown.remove(next);
+    }
+    let mut used = 0;
+    shown
+        .iter()
+        .take_while(|hint| {
+            used += width(hint);
+            used <= room
+        })
+        .map(|&(keys, what, _)| (keys, what))
+        .collect()
 }
 
 /// The status a column left (-1) or right (1) of `s`, if there's one.
@@ -865,13 +957,16 @@ fn styles(picked: bool) -> (Style, Style, Style) {
     (plain, title, Style { bg, ..quiet })
 }
 
-/// A `▌` when the row is marked, else a space.
+/// A `▌` when the row is marked, else a space. The bar is in the terminal's own
+/// foreground, bold, picked or not: the highlight's grey would vanish on the
+/// picked row, and a priority's colour would read as a priority.
 fn bar(row: &mut Row, marked: bool, plain: Style) {
     if marked {
         row.push(
             "▌",
             Style {
-                fg: Some(HIGHLIGHT),
+                fg: None,
+                bold: true,
                 ..plain
             },
         );
@@ -1096,6 +1191,7 @@ fn tail(s: &str, max: usize) -> String {
 struct Style {
     fg: Option<Color>,
     bg: Option<Color>,
+    bold: bool,
     italic: bool,
 }
 
@@ -1153,6 +1249,9 @@ fn sgr(style: Style, color: bool) -> String {
         (Some(bg), true) => sgr += &format!(";48;5;{bg}"),
         (Some(_), false) => sgr += ";7",
         (None, _) => {}
+    }
+    if style.bold {
+        sgr += ";1";
     }
     if style.italic {
         sgr += ";3";
@@ -1514,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn a_marked_card_shows_a_bar_in_the_highlights_colour_picked_or_not() {
+    fn a_marked_card_shows_a_bold_bar_in_the_terminals_foreground_picked_or_not() {
         let mut board = sample();
         press(&mut board, "  k");
         assert_eq!(picked_id(&board), Some(2));
@@ -1522,14 +1621,23 @@ mod tests {
         for (line, picked) in [(&lines[3], true), (&lines[4], false)] {
             assert_eq!(text(line).chars().nth(MARGIN), Some('▌'), "its first cell");
             let bar = line.iter().find(|s| s.text == "▌").unwrap();
-            assert_eq!(bar.style.fg, Some(HIGHLIGHT));
-            assert_eq!(bar.style.bg.is_some(), picked);
+            // Not the highlight's grey (gone on the picked row), nor a
+            // priority's colour (it would read as one).
+            assert_eq!(bar.style.fg, None, "the terminal's own foreground");
+            assert!(bar.style.bold);
+            assert_eq!(bar.style.bg.is_some(), picked, "on the row's background");
         }
         assert_eq!(
             text(&lines[3]).matches('▌').count(),
             1,
             "fix bike isn't marked"
         );
+
+        let mut out = Vec::new();
+        paint(&mut out, &lines, cursor, true).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("\x1b[0;48;5;236;1m▌"), "picked: bold, no fg");
+        assert!(out.contains("\x1b[0;1m▌"), "unpicked: bold, no fg");
 
         let mut out = Vec::new();
         paint(&mut out, &lines, cursor, false).unwrap();
@@ -2305,6 +2413,151 @@ mod tests {
     }
 
     #[test]
+    fn a_card_moved_into_done_finishes_its_open_sub_items_and_h_reopens_none() {
+        let mut board = sub_sample();
+        run_keys(&mut board, "l");
+        assert_eq!(status(&board, 2), Status::Doing);
+        assert_eq!(status(&board, 6), Status::Todo, "not done yet");
+        assert_eq!(board.message, None);
+
+        // One change, so one save, for the card and what's open under it.
+        let [Outcome::Change(op)] = &mut press(&mut board, "l")[..] else {
+            panic!("l is one change");
+        };
+        board.apply(std::mem::replace(op, Op::Finish { ids: vec![] }));
+        for id in [2, 5, 6, 7] {
+            assert_eq!(status(&board, id), Status::Done, "{id}");
+        }
+        assert_eq!(status(&board, 8), Status::Todo, "not its sub item");
+        assert_eq!(
+            board.message.as_deref(),
+            Some("Done its 2 open sub items too")
+        );
+
+        run_keys(&mut board, "h");
+        assert_eq!(status(&board, 2), Status::Doing);
+        for id in [5, 6, 7] {
+            assert_eq!(status(&board, id), Status::Done, "{id} stays done");
+        }
+        assert_eq!(board.message, None);
+
+        // d says it too.
+        let mut board = sub_sample();
+        run_keys(&mut board, "d");
+        assert_eq!(status(&board, 6), Status::Done);
+        assert_eq!(
+            board.message.as_deref(),
+            Some("Done its 2 open sub items too")
+        );
+    }
+
+    #[test]
+    fn marked_cards_moved_into_done_finish_their_open_sub_items() {
+        // Pay rent and fix bike both in Doing, marked; 9 is open under fix bike.
+        let mut board = sub_sample();
+        board
+            .tasks
+            .push(sub(task(9, "pump the tyres", Status::Todo, None, &[]), 3));
+        board.tasks[1].status = Status::Doing;
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(ids(&board, 1), [2, 5, 6, 7, 3, 9]);
+        press(&mut board, " jjj ");
+        assert_eq!(board.marked, BTreeSet::from([2, 3]));
+        run_keys(&mut board, "l");
+        for id in [2, 3, 5, 6, 7, 9] {
+            assert_eq!(status(&board, id), Status::Done, "{id}");
+        }
+        assert_eq!(
+            board.message.as_deref(),
+            Some("Done their 3 open sub items too")
+        );
+
+        // A marked sub item of an unmarked card stays, and both are said.
+        let mut board = sub_sample();
+        board
+            .tasks
+            .push(sub(task(9, "pump the tyres", Status::Todo, None, &[]), 3));
+        press(&mut board, "jj ");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, " ");
+        assert_eq!(board.marked, BTreeSet::from([3, 6]));
+        run_keys(&mut board, "l");
+        assert_eq!(
+            (status(&board, 3), status(&board, 9), status(&board, 6)),
+            (Status::Done, Status::Done, Status::Todo)
+        );
+        assert_eq!(
+            board.message.as_deref(),
+            Some("1 sub item stayed: a sub item moves with its task; Done its 1 open sub item too")
+        );
+    }
+
+    #[test]
+    fn a_sub_item_whose_card_went_meanwhile_is_added_as_a_task_of_its_own() {
+        let mut board = sub_sample();
+        press(&mut board, "A");
+        assert_eq!(
+            board.input.as_ref().map(|i| i.kind),
+            Some(InputKind::Sub(2))
+        );
+        // Meanwhile a `halil rm 2` elsewhere took pay rent and its sub items.
+        let fresh = sub_sample()
+            .tasks
+            .into_iter()
+            .filter(|t| t.id != 2 && t.parent != Some(2))
+            .collect();
+        board.replace_tasks(fresh);
+        press(&mut board, "call the bank");
+        assert!(enter(&mut board));
+        let added = board.tasks.last().unwrap();
+        assert_eq!(
+            (added.id, added.parent),
+            (2, None),
+            "its own task, not one under itself"
+        );
+        assert_eq!(
+            board.message.as_deref(),
+            Some("task 2 is gone: added as a task of its own")
+        );
+        // A card like any other: it takes sub items.
+        assert_eq!(picked_id(&board), Some(2));
+        press(&mut board, "A");
+        assert_eq!(
+            board.input.as_ref().map(|i| i.kind),
+            Some(InputKind::Sub(2))
+        );
+    }
+
+    #[test]
+    fn a_minus_tag_in_the_title_stays_a_word_when_e_reads_the_title_again() {
+        // `halil add x -money +money`: add takes no tag off, so -money is a
+        // word of the title, beside the tag.
+        let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
+        let added = parse::parse(&["x -money +money".into()], now).unwrap();
+        assert_eq!(
+            (added.title.as_str(), &added.tags[..]),
+            ("x -money", &["money".to_string()][..])
+        );
+        let x = || task(1, "x -money", Status::Todo, None, &["money"]);
+        let mut board = Board::new(vec![x()], today());
+
+        press(&mut board, "e");
+        assert_eq!(
+            key(&mut board, KeyCode::Enter),
+            Outcome::Nothing,
+            "untouched"
+        );
+        assert_eq!(board.tasks, [x()]);
+
+        press(&mut board, "e !high");
+        assert!(enter(&mut board));
+        let edited = by_id(&board, 1);
+        assert_eq!(edited.title, "x -money");
+        assert_eq!(edited.tags, ["money"]);
+        assert_eq!(edited.priority, Some(Priority::High));
+    }
+
+    #[test]
     fn capital_a_adds_a_sub_item_under_the_picked_card_with_the_grammar_of_a() {
         let mut board = sub_sample();
         press(&mut board, "A");
@@ -2336,19 +2589,63 @@ mod tests {
         );
     }
 
+    /// The footer of `board` drawn `w` wide.
+    fn footer(board: &mut Board, w: usize) -> String {
+        let (lines, _) = board.draw(w, 12);
+        text(&lines[11])
+    }
+
     #[test]
-    fn the_ordinary_footer_offers_capital_a_and_fits_80_columns() {
+    fn at_80_columns_the_footers_fit_tab_giving_way_first() {
         let mut board = sample();
-        let (lines, _) = board.draw(80, 12);
-        let footer = text(&lines[11]);
         assert_eq!(
-            footer,
-            "  j k pick  space mark  h l move  tab column  a add  A sub  e edit  d done "
+            footer(&mut board, 100),
+            "  j k pick  space mark  h l move  tab column  a add  A sub  e edit  d done  q quit ",
+            "all of it, where there's room"
         );
-        let (lines, _) = board.draw(100, 12);
-        assert!(
-            text(&lines[11]).ends_with(" d done  q quit "),
-            "q gives way first"
+        assert_eq!(
+            footer(&mut board, 80),
+            "  j k pick  space mark  h l move  a add  A sub  e edit  d done  q quit "
+        );
+
+        // A sub item picked: d's word for it stays, and so does the rest.
+        let mut board = sub_sample();
+        press(&mut board, "j");
+        assert_eq!(
+            footer(&mut board, 80),
+            "  j k pick  space mark  h l move  a add  A sub  e edit  d done/open  q quit "
+        );
+
+        let mut board = marked_sample();
+        assert_eq!(
+            footer(&mut board, 80),
+            "  2 marked   h l move   e edit   d done   esc clear"
+        );
+    }
+
+    #[test]
+    fn a_narrow_footer_gives_way_by_need_and_keeps_d() {
+        // tab, then q, then j k; past them the least needed, d never.
+        let mut board = sub_sample();
+        press(&mut board, "j");
+        for (w, want) in [
+            (
+                75,
+                "  j k pick  space mark  h l move  a add  A sub  e edit  d done/open ",
+            ),
+            (
+                67,
+                "  space mark  h l move  a add  A sub  e edit  d done/open ",
+            ),
+            (46, "  h l move  a add  e edit  d done/open "),
+        ] {
+            assert_eq!(footer(&mut board, w), want, "{w} wide");
+        }
+        let mut board = marked_sample();
+        assert_eq!(
+            footer(&mut board, 46),
+            "  2 marked   h l move   e edit   d done",
+            "esc clear goes first"
         );
     }
 
