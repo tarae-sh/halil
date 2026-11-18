@@ -135,8 +135,8 @@ fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said
                 false => format!("Done {}\n", tasks[i]),
             };
             if !open.is_empty() {
-                let n = task::count_of(open.len(), "open sub item");
-                text += &format!("Done its {n} too\n");
+                text += &task::done_with(open.len(), false);
+                text.push('\n');
             }
             said(text, !was_done || !open.is_empty())
         }
@@ -311,7 +311,7 @@ mod tests {
         let said = run(Command::Done { id: 3 }, &mut tasks).unwrap();
         assert_eq!(
             said.text,
-            "Done 3: ship 0.2.0\nDone its 2 open sub items too\n"
+            "Done 3: ship 0.2.0\nDone, with its 2 open sub items.\n"
         );
         assert!(tasks.iter().all(|t| t.id == 4 || t.status == Status::Done));
         assert_eq!(tasks[1].status, Status::Todo);
@@ -322,6 +322,21 @@ mod tests {
         assert!(!said.changed);
         let said = run(Command::Done { id: 4 }, &mut tasks).unwrap();
         assert_eq!(said.text, "Done 4: buy milk\n");
+    }
+
+    #[test]
+    fn edit_with_only_a_tag_the_task_hasnt_is_refused() {
+        let mut tasks = ship();
+        let err = run(
+            Command::Edit {
+                id: 3,
+                words: words("-money"),
+            },
+            &mut tasks,
+        )
+        .unwrap_err();
+        assert_eq!(err, "3 has no tag money");
+        assert_eq!(tasks, ship(), "the title untouched");
     }
 
     #[test]

@@ -48,8 +48,8 @@ no words are left):
 - **A due date.** A day (`today`, `tomorrow`, `friday` or `fri`, `next friday`, `in 3 days`, `in a week`,
   `nov 20`, `2026-11-20`), a time (`9am`, `9:30pm`, `14:30`, `noon`, `eod`), or both (`in 2 hours`). A time on
   its own means the next time it comes. `at`, `by`, `on` or `due` before a date goes with it.
-- **Tags**, as `+home`. `edit` takes one off with `-home`, when the task has it (else `-home` is a word of
-  the title).
+- **Tags**, as `+home`. `edit` takes one off with `-home`, when the task has it. When it hasn't, `-home` is a
+  word of the title beside other words, and alone it's refused (`3 has no tag home`), the title kept.
 - **A priority**, as `!high`, `!med` or `!low`.
 
 The list shows due dates in words from now (`today 6pm`, `tomorrow`, `fri`, `in 3w`, `2d late`), red when late.

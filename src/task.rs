@@ -144,6 +144,13 @@ pub fn count_of(n: usize, noun: &str) -> String {
     }
 }
 
+/// `Done, with its 2 open sub items.`: the note when finishing a task (or,
+/// `several`, a few) finished `n` open sub items too.
+pub fn done_with(n: usize, several: bool) -> String {
+    let whose = if several { "their" } else { "its" };
+    format!("Done, with {whose} {}.", count_of(n, "open sub item"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

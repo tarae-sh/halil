@@ -50,11 +50,17 @@ pub fn save(path: &Path, tasks: &[Task]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(fail)?;
     }
-    let tmp = path.with_extension("jsonl.tmp");
+    let tmp = temp_beside(path, std::process::id());
     let mut file = File::create(&tmp).map_err(fail)?;
     file.write_all(text.as_bytes()).map_err(fail)?;
     file.sync_all().map_err(fail)?;
     fs::rename(&tmp, path).map_err(fail)
+}
+
+/// Where process `pid` writes a save before renaming it over `path`: a name of
+/// its own, so two halil saving at once never write into one file.
+fn temp_beside(path: &Path, pid: u32) -> PathBuf {
+    path.with_extension(format!("jsonl.{pid}.tmp"))
 }
 
 #[cfg(test)]
@@ -194,6 +200,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(&path).unwrap(), sample());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn each_halil_saves_through_a_temp_file_of_its_own() {
+        let dir = temp_dir("own-temp");
+        let path = dir.join("tasks.jsonl");
+        let mine = std::process::id();
+        // Another halil is halfway through its save: ours leaves its file be.
+        let theirs = temp_beside(&path, mine.wrapping_add(1));
+        fs::write(&theirs, "half a save\n").unwrap();
+        save(&path, &sample()).unwrap();
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "half a save\n");
+        assert_eq!(load(&path).unwrap(), sample());
+        let ours = temp_beside(&path, mine);
+        assert_eq!(ours, dir.join(format!("tasks.jsonl.{mine}.tmp")));
+        assert!(!ours.exists(), "renamed into place");
         fs::remove_dir_all(dir).unwrap();
     }
 

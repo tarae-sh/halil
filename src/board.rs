@@ -191,8 +191,11 @@ pub struct Board {
     marked: BTreeSet<u32>,
     /// The words being typed after `a`, `A` or `e`.
     input: Option<Input>,
-    /// An error to show until the next key.
+    /// An error or a refusal to show until the next key, in red.
     pub message: Option<String>,
+    /// A note of what a change did besides what was asked, shown until the
+    /// next key in the default foreground, after `message` if there's one.
+    pub note: Option<String>,
     /// The day due dates are read from.
     today: Date,
 }
@@ -208,6 +211,7 @@ impl Board {
             marked: BTreeSet::new(),
             input: None,
             message: None,
+            note: None,
         }
     }
 
@@ -289,16 +293,27 @@ impl Board {
     }
 
     /// Takes the tasks as they are on disk now, keeping the picked card picked
-    /// while it's still in its column, and the marks on the cards still there.
+    /// while it's still in its column, and the marks on the rows still in sight.
     pub fn replace_tasks(&mut self, tasks: Vec<Task>) {
         let picked = self.picked().map(|i| self.tasks[i].id);
         self.tasks = tasks;
-        self.marked
-            .retain(|id| self.tasks.iter().any(|t| t.id == *id));
+        self.keep_marks_in_sight();
         if let Some(id) = picked {
             self.repick(id, self.col);
         }
         self.clamp();
+    }
+
+    /// Drops the marks on tasks that are gone, and on sub items whose card is
+    /// done: folded into its count, out of sight, they're no rows for a key to
+    /// act on.
+    fn keep_marks_in_sight(&mut self) {
+        let parents = task::parents(&self.tasks);
+        let in_sight: BTreeSet<u32> = (0..self.tasks.len())
+            .filter(|&i| parents[i].is_none_or(|p| self.tasks[p].status != Status::Done))
+            .map(|i| self.tasks[i].id)
+            .collect();
+        self.marked.retain(|id| in_sight.contains(id));
     }
 
     pub fn apply(&mut self, op: Op) {
@@ -384,6 +399,8 @@ impl Board {
                 self.pick(id);
             }
         }
+        // A card gone to Done (d, l, a marked l) folds its sub items away.
+        self.keep_marks_in_sight();
         self.clamp();
     }
 
@@ -399,8 +416,7 @@ impl Board {
     }
 
     /// Marks done the open sub items of those of `ids` that are cards, since
-    /// their card is now done, and says how many on the message row (after
-    /// what it says already).
+    /// their card is now done, and says how many in a note.
     fn finish_sub_items(&mut self, ids: &[u32]) {
         let parents = task::parents(&self.tasks);
         let mut cards = BTreeSet::new();
@@ -416,12 +432,7 @@ impl Board {
             }
         }
         if n > 0 {
-            let whose = if cards.len() == 1 { "its" } else { "their" };
-            let said = format!("Done {whose} {} too", task::count_of(n, "open sub item"));
-            self.message = Some(match self.message.take() {
-                Some(m) => format!("{m}; {said}"),
-                None => said,
-            });
+            self.note = Some(task::done_with(n, cards.len() > 1));
         }
     }
 
@@ -432,6 +443,7 @@ impl Board {
 
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
         self.message = None;
+        self.note = None;
         if self.input.is_some() {
             return self.input_key(key);
         }
@@ -439,6 +451,9 @@ impl Board {
         let last = self.column(self.col).len().saturating_sub(1);
         match key.code {
             KeyCode::Char('c') if ctrl => return Outcome::Quit,
+            // No other chord is its letter: Ctrl-L, a redraw elsewhere, would
+            // move a card, Ctrl-D finish one.
+            KeyCode::Char(_) if ctrl => {}
             KeyCode::Char('q') => return Outcome::Quit,
             KeyCode::Esc => {
                 if self.marked.is_empty() {
@@ -644,19 +659,34 @@ impl Board {
         let tasks: Vec<&Task> = self.tasks.iter().filter(|t| ids.contains(&t.id)).collect();
         // `e` on one fills in its title, which is read again: a `-tag` that's
         // a word of that title went in as one (the task hadn't the tag then),
-        // and stays one, or an untouched enter would take the tag off.
+        // and stays one, or an untouched enter would take the tag off. When
+        // only `-words` are left for the title, though, the title is gone from
+        // the input, and they're tags to take off: one the task hasn't is
+        // refused, as `halil edit` refuses it.
         let in_title = |t: &Task, tag: &str| {
-            kind != InputKind::EditMarked
-                && t.title
-                    .split_whitespace()
-                    .any(|w| w.strip_prefix('-').is_some_and(|w| w.to_lowercase() == tag))
+            t.title
+                .split_whitespace()
+                .any(|w| w.strip_prefix('-').is_some_and(|w| w.to_lowercase() == tag))
         };
-        let has = |tag: &str| {
-            tasks
-                .iter()
-                .any(|t| t.tags.iter().any(|own| own == tag) && !in_title(t, tag))
+        let read = |keep_title_words: bool| {
+            parse::change(words, now, |tag| {
+                tasks.iter().any(|t| {
+                    t.tags.iter().any(|own| own == tag) && !(keep_title_words && in_title(t, tag))
+                })
+            })
         };
-        let change = match parse::change(words, now, has) {
+        let change = match kind {
+            InputKind::Edit(id) => {
+                read(true).and_then(|c| match parse::refuse_missing_tags(id, &c) {
+                    Ok(()) => Ok(c),
+                    Err(_) => {
+                        read(false).and_then(|c| parse::refuse_missing_tags(id, &c).map(|()| c))
+                    }
+                })
+            }
+            _ => read(false),
+        };
+        let change = match change {
             Ok(change) => change,
             Err(e) => {
                 self.message = Some(e);
@@ -758,9 +788,20 @@ impl Board {
             lines.push(row.spans);
         }
 
+        // A refusal in red, then a note of what was done in the terminal's
+        // own colour, three cells after it.
         let mut message = Row::default();
-        if let Some(m) = &self.message {
-            message.push(&truncate(&format!("  {m}"), w), Style::fg(RED));
+        for (said, style) in [
+            (&self.message, Style::fg(RED)),
+            (&self.note, Style::default()),
+        ] {
+            let gap = if message.width == 0 { 2 } else { 3 };
+            if let Some(said) = said
+                && message.width + gap < w
+            {
+                message.pad_to(message.width + gap, Style::default());
+                message.push(&truncate(said, w - message.width), style);
+            }
         }
         lines.push(message.spans);
 
@@ -1482,6 +1523,43 @@ mod tests {
     }
 
     #[test]
+    fn a_ctrl_chord_is_never_its_letters_act_and_ctrl_c_quits() {
+        // Ctrl-L, a redraw elsewhere, moved a card; Ctrl-D finished one. Each
+        // chord on a board of its own, so none hides another's act.
+        let chords = ['l', 'd'].into_iter().chain('a'..='z').chain(['A', ' ']);
+        for c in chords.filter(|&c| c != 'c') {
+            let mut board = sub_sample();
+            assert_eq!(ctrl(&mut board, c), Outcome::Nothing, "ctrl-{c}");
+            assert_eq!(board.tasks, sub_sample().tasks, "ctrl-{c}");
+            assert_eq!(
+                (board.col, picked_id(&board)),
+                (0, Some(2)),
+                "ctrl-{c} moved nothing"
+            );
+            assert!(board.marked.is_empty(), "ctrl-{c} marked nothing");
+            assert_eq!(board.input, None, "ctrl-{c} opened nothing");
+        }
+
+        // In the input, only ctrl-a, ctrl-e, ctrl-u, ctrl-w and ctrl-c do
+        // anything, and none types its letter.
+        let mut board = sub_sample();
+        press(&mut board, "abuy milk");
+        for c in ('a'..='z').filter(|&c| !"aceuw".contains(c)) {
+            assert_eq!(
+                board.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                Outcome::Nothing,
+                "ctrl-{c}"
+            );
+        }
+        assert_eq!(typed(&board), Some("buy milk"));
+        let input = board.input.as_ref().unwrap();
+        assert_eq!(input.cursor, input.text.len(), "the cursor stayed");
+        ctrl(&mut board, 'c');
+        assert_eq!(board.input, None);
+        assert_eq!(ctrl(&mut board, 'c'), Outcome::Quit);
+    }
+
+    #[test]
     fn changes_are_made_to_the_tasks_as_they_are_on_disk() {
         let mut board = sample();
         let Outcome::Change(op) = board.key(KeyEvent::from(KeyCode::Char('l'))) else {
@@ -1659,6 +1737,42 @@ mod tests {
         let (lines, _) = board.draw(100, 12);
         let footer = text(&lines[11]);
         assert!(footer.trim_start().starts_with("1 marked"), "{footer:?}");
+    }
+
+    #[test]
+    fn marks_on_sub_items_drop_when_their_card_goes_to_done() {
+        // Pay rent (2), its sub item 6 and buy milk (1) marked.
+        let mut board = sub_sample();
+        press(&mut board, " j j ");
+        assert_eq!(board.marked, BTreeSet::from([1, 2, 6]));
+        run_keys(&mut board, "l");
+        assert_eq!(
+            board.marked,
+            BTreeSet::from([1, 2, 6]),
+            "in Doing, 6 is in sight under its card"
+        );
+        run_keys(&mut board, "l");
+        assert_eq!(
+            board.marked,
+            BTreeSet::from([1, 2]),
+            "in Done, 6 is folded into the count: no row for d to act on"
+        );
+        let (lines, _) = board.draw(100, 14);
+        assert!(text(&lines[13]).trim_start().starts_with("2 marked"));
+
+        // Meanwhile a `halil done 2` elsewhere: the reload drops 6's mark.
+        let mut board = sub_sample();
+        press(&mut board, "jj ");
+        assert_eq!(board.marked, BTreeSet::from([6]));
+        let mut fresh = sub_sample().tasks;
+        for t in fresh
+            .iter_mut()
+            .filter(|t| t.id == 2 || t.parent == Some(2))
+        {
+            t.status = Status::Done;
+        }
+        board.replace_tasks(fresh);
+        assert!(board.marked.is_empty());
     }
 
     #[test]
@@ -2430,24 +2544,25 @@ mod tests {
         }
         assert_eq!(status(&board, 8), Status::Todo, "not its sub item");
         assert_eq!(
-            board.message.as_deref(),
-            Some("Done its 2 open sub items too")
+            board.note.as_deref(),
+            Some("Done, with its 2 open sub items.")
         );
+        assert_eq!(board.message, None, "a note, not a refusal");
 
         run_keys(&mut board, "h");
         assert_eq!(status(&board, 2), Status::Doing);
         for id in [5, 6, 7] {
             assert_eq!(status(&board, id), Status::Done, "{id} stays done");
         }
-        assert_eq!(board.message, None);
+        assert_eq!((&board.message, &board.note), (&None, &None));
 
         // d says it too.
         let mut board = sub_sample();
         run_keys(&mut board, "d");
         assert_eq!(status(&board, 6), Status::Done);
         assert_eq!(
-            board.message.as_deref(),
-            Some("Done its 2 open sub items too")
+            board.note.as_deref(),
+            Some("Done, with its 2 open sub items.")
         );
     }
 
@@ -2468,8 +2583,8 @@ mod tests {
             assert_eq!(status(&board, id), Status::Done, "{id}");
         }
         assert_eq!(
-            board.message.as_deref(),
-            Some("Done their 3 open sub items too")
+            board.note.as_deref(),
+            Some("Done, with their 3 open sub items.")
         );
 
         // A marked sub item of an unmarked card stays, and both are said.
@@ -2488,8 +2603,44 @@ mod tests {
         );
         assert_eq!(
             board.message.as_deref(),
-            Some("1 sub item stayed: a sub item moves with its task; Done its 1 open sub item too")
+            Some("1 sub item stayed: a sub item moves with its task")
         );
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Done, with its 1 open sub item.")
+        );
+    }
+
+    #[test]
+    fn a_note_is_drawn_in_the_default_foreground_and_a_refusal_in_red_beside_it() {
+        let style = |line: &Line, s: &str| line.iter().find(|span| span.text == s).unwrap().style;
+        let mut board = sub_sample();
+        run_keys(&mut board, "d");
+        let (lines, _) = board.draw(100, 14);
+        assert_eq!(text(&lines[12]), "  Done, with its 2 open sub items.");
+        let note = style(&lines[12], "Done, with its 2 open sub items.");
+        assert_eq!(note.fg, None, "not red: nothing was refused");
+
+        // Joined to the refusal that a marked sub item stayed: each in its own
+        // colour, three cells apart.
+        let mut board = sub_sample();
+        board
+            .tasks
+            .push(sub(task(9, "pump the tyres", Status::Todo, None, &[]), 3));
+        press(&mut board, "jj ");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, " ");
+        run_keys(&mut board, "l");
+        let (lines, _) = board.draw(100, 14);
+        let stayed = "1 sub item stayed: a sub item moves with its task";
+        let done = "Done, with its 1 open sub item.";
+        assert_eq!(text(&lines[12]), format!("  {stayed}   {done}"));
+        assert_eq!(style(&lines[12], stayed).fg, Some(RED));
+        assert_eq!(style(&lines[12], done).fg, None);
+
+        // Too narrow for both: the note is cut, the refusal stays whole.
+        let (lines, _) = board.draw(60, 14);
+        assert_eq!(text(&lines[12]), format!("  {stayed}   Done,…"));
     }
 
     #[test]
@@ -2555,6 +2706,26 @@ mod tests {
         assert_eq!(edited.title, "x -money");
         assert_eq!(edited.tags, ["money"]);
         assert_eq!(edited.priority, Some(Priority::High));
+
+        // The title cleared, -money alone: the tag it has comes off.
+        press(&mut board, "e");
+        ctrl(&mut board, 'u');
+        press(&mut board, "-money");
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, 1).title, "x -money");
+        assert!(by_id(&board, 1).tags.is_empty());
+    }
+
+    #[test]
+    fn e_with_only_a_tag_the_card_hasnt_is_refused_and_keeps_the_words() {
+        let mut board = sample();
+        press(&mut board, "e");
+        ctrl(&mut board, 'u');
+        press(&mut board, "-work");
+        assert_eq!(key(&mut board, KeyCode::Enter), Outcome::Nothing);
+        assert_eq!(board.message.as_deref(), Some("2 has no tag work"));
+        assert_eq!(typed(&board), Some("-work"));
+        assert_eq!(board.tasks, sample().tasks, "the title untouched");
     }
 
     #[test]

@@ -10,7 +10,7 @@ readme = "README.md"
 keywords = ["todo", "tasks", "cli", "tui"]
 categories = ["command-line-utilities"]
 # The README's picture is linked by its URL: the crate needn't carry it.
-exclude = ["docs/"]
+exclude = ["docs/", "NOTES.md"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

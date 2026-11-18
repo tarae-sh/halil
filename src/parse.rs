@@ -83,8 +83,33 @@ pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), Stri
             "nothing to change: give a new title, a date, +tags, -tags or a !priority".into(),
         );
     }
+    refuse_missing_tags(task.id, &change)?;
     change.apply(task);
     Ok(())
+}
+
+/// Refuses `change` to task `id` when every word left for the title is a
+/// `-word`: tags the task hasn't, meant to come off, which as its title would
+/// replace its own (`3 has no tag money`). Beside other words of a title, a
+/// `-word` is one of them.
+pub fn refuse_missing_tags(id: u32, change: &Change) -> Result<(), String> {
+    let Some(title) = &change.title else {
+        return Ok(());
+    };
+    let mut tags: Vec<String> = Vec::new();
+    for word in title.split_whitespace() {
+        match word.strip_prefix('-').filter(|t| !t.is_empty()) {
+            Some(tag) if !tags.contains(&tag.to_lowercase()) => tags.push(tag.to_lowercase()),
+            Some(_) => {}
+            None => return Ok(()),
+        }
+    }
+    let named = match tags.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => return Ok(()),
+    };
+    Err(format!("{id} has no tag {named}"))
 }
 
 /// `parse`'s reading, the title allowed empty, and the `-tags` that `has`.
@@ -299,6 +324,25 @@ mod tests {
             "x -money",
             "add has no tags to take off"
         );
+    }
+
+    #[test]
+    fn minus_tags_the_task_hasnt_alone_for_a_title_are_refused() {
+        let mut task = rent();
+        assert_eq!(edit(&mut task, "-work"), Err("1 has no tag work".into()));
+        assert_eq!(
+            edit(&mut task, "-Work -car -work"),
+            Err("1 has no tag work or car".into())
+        );
+        // -home comes off, but -work would be the title: all of it refused.
+        assert_eq!(
+            edit(&mut task, "-home -work !high"),
+            Err("1 has no tag work".into())
+        );
+        assert_eq!(task, rent(), "the title untouched, and the rest");
+        // Beside other words, a -word is one of the title's, as before.
+        edit(&mut task, "rent -work").unwrap();
+        assert_eq!(task.title, "rent -work");
     }
 
     #[test]
