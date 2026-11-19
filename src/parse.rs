@@ -281,6 +281,7 @@ mod tests {
             tags: vec!["home".into()],
             due: Some("2026-11-20".parse().unwrap()),
             parent: None,
+            stamp: 0,
         }
     }
 

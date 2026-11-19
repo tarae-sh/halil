@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::task::Task;
+use crate::task::{self, Task};
 
 /// `$XDG_DATA_HOME/halil/tasks.jsonl`, else `~/.local/share/halil/tasks.jsonl`.
 pub fn default_path() -> Result<PathBuf, String> {
@@ -20,21 +20,26 @@ pub fn default_path() -> Result<PathBuf, String> {
 }
 
 /// Reads every task. A missing file is no tasks; a line that doesn't parse is
-/// an error naming it, so a save never drops what it couldn't read.
+/// an error naming it, so a save never drops what it couldn't read. A line
+/// without a stamp gets one (see [`task::stamp_unstamped`]), written by the
+/// next save.
 pub fn load(path: &Path) -> Result<Vec<Task>, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("can't read {}: {e}", path.display())),
     };
-    text.lines()
+    let mut tasks = text
+        .lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
         .map(|(i, line)| {
             serde_json::from_str(line)
                 .map_err(|e| format!("{}:{}: not a task: {e}", path.display(), i + 1))
         })
-        .collect()
+        .collect::<Result<Vec<Task>, String>>()?;
+    task::stamp_unstamped(&mut tasks);
+    Ok(tasks)
 }
 
 /// Writes every task, replacing the file whole: written beside it first, then
@@ -86,6 +91,7 @@ mod tests {
                 tags: vec![],
                 due: None,
                 parent: None,
+                stamp: 1_763_500_000_001,
             },
             Task {
                 id: 2,
@@ -95,9 +101,18 @@ mod tests {
                 tags: vec!["home".into(), "money".into()],
                 due: Some("2026-11-20T09:00".parse().unwrap()),
                 parent: None,
+                stamp: 1_763_500_000_002,
             },
         ]
     }
+
+    /// The sample as 0.1.0 wrote it: no sub items, no stamps.
+    const FROM_0_1: &str = concat!(
+        r#"{"id":1,"title":"buy milk","status":"todo"}"#,
+        "\n",
+        r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"],"due":"2026-11-20T09:00"}"#,
+        "\n",
+    );
 
     #[test]
     fn saves_and_loads_the_same_tasks() {
@@ -117,9 +132,9 @@ mod tests {
         assert_eq!(
             text,
             concat!(
-                r#"{"id":1,"title":"buy milk","status":"todo"}"#,
+                r#"{"id":1,"title":"buy milk","status":"todo","stamp":1763500000001}"#,
                 "\n",
-                r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"],"due":"2026-11-20T09:00"}"#,
+                r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"],"due":"2026-11-20T09:00","stamp":1763500000002}"#,
                 "\n",
             )
         );
@@ -169,37 +184,70 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_item_names_its_parent_and_a_file_from_0_1_0_loads() {
+    fn a_sub_item_names_its_parent() {
         let dir = temp_dir("parent");
         let path = dir.join("tasks.jsonl");
         let mut tasks = sample();
         tasks[1].parent = Some(1);
         save(&path, &tasks).unwrap();
         let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.lines().next().unwrap().contains("parent"));
         assert!(
             text.lines()
-                .next()
+                .nth(1)
                 .unwrap()
-                .ends_with(r#""status":"todo"}"#)
-        );
-        assert!(
-            text.lines().nth(1).unwrap().ends_with(r#","parent":1}"#),
+                .ends_with(r#","parent":1,"stamp":1763500000002}"#),
             "{text}"
         );
         assert_eq!(load(&path).unwrap(), tasks);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
-        // Written by 0.1.0, before sub items: none has a parent.
-        fs::write(
-            &path,
-            concat!(
-                r#"{"id":1,"title":"buy milk","status":"todo"}"#,
-                "\n",
-                r#"{"id":2,"title":"pay rent","status":"done","priority":"high","tags":["home","money"],"due":"2026-11-20T09:00"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        assert_eq!(load(&path).unwrap(), sample());
+    #[test]
+    fn files_from_0_1_and_0_2_load_as_they_are_and_get_stamps_when_next_saved() {
+        let dir = temp_dir("older");
+        let path = dir.join("tasks.jsonl");
+        // 0.2.0's adds a sub item; neither has stamps.
+        let from_0_2 = format!(
+            "{FROM_0_1}{}\n",
+            r#"{"id":3,"title":"transfer it","status":"todo","parent":2}"#
+        );
+        for (version, text) in [("0.1", FROM_0_1), ("0.2", from_0_2.as_str())] {
+            fs::write(&path, text).unwrap();
+            let tasks = load(&path).unwrap();
+            let unstamped: Vec<Task> = tasks
+                .iter()
+                .map(|t| Task {
+                    stamp: 0,
+                    ..t.clone()
+                })
+                .collect();
+            let mut want = sample();
+            for t in &mut want {
+                t.stamp = 0;
+            }
+            assert_eq!(unstamped[..2], want[..], "{version}: as they are");
+            assert!(
+                tasks.iter().all(|t| t.stamp > 0 && t.stamp < 1 << 32),
+                "{version}: stamps of their own: {tasks:?}"
+            );
+            assert_eq!(
+                load(&path).unwrap(),
+                tasks,
+                "{version}: the same on every read"
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                text,
+                "{version}: reading writes nothing"
+            );
+
+            // The next save writes them, and they hold from then on.
+            save(&path, &tasks).unwrap();
+            let saved = fs::read_to_string(&path).unwrap();
+            assert_eq!(saved.matches("\"stamp\":").count(), tasks.len(), "{saved}");
+            assert_eq!(load(&path).unwrap(), tasks, "{version}");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

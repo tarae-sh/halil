@@ -1,5 +1,7 @@
 mod board;
+mod clip;
 mod date;
+mod hangul;
 mod list;
 mod parse;
 mod store;
@@ -188,6 +190,7 @@ fn new_task(tasks: &[Task], parsed: parse::Parsed, parent: Option<u32>) -> Task 
         tags: parsed.tags,
         due: parsed.due,
         parent,
+        stamp: task::new_stamp(tasks, task::now_ms()),
     }
 }
 
@@ -223,6 +226,7 @@ mod tests {
             tags: vec![],
             due: None,
             parent,
+            stamp: 0,
         }
     }
 
@@ -270,6 +274,7 @@ mod tests {
         let added = tasks.last().unwrap();
         assert_eq!((added.id, added.parent), (1, Some(4)));
         assert_eq!(added.tags, ["errand"]);
+        assert!(added.stamp >= 1_763_500_000_000, "stamped when made");
 
         // done and edit take a sub item's id as they take a task's.
         run(

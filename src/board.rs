@@ -6,11 +6,12 @@
 //! terminal while the board is open isn't lost.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -26,6 +27,8 @@ use jiff::civil::Date;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::clip::{self, Clipboard};
+use crate::hangul;
 use crate::parse::{self, Change, Parsed};
 use crate::store;
 use crate::task::{self, Priority, Status, Task};
@@ -56,7 +59,7 @@ pub fn run(path: &Path, tasks: Vec<Task>) -> Result<(), String> {
     let mut board = Board::new(tasks, Zoned::now().date());
     let mut out = io::stdout();
     let _screen = Screen::enter(&mut out).map_err(term_err)?;
-    event_loop(&mut board, path, &mut out, color)
+    event_loop(&mut board, path, &mut out, color, clip::detect())
 }
 
 /// Raw mode on the alternate screen for as long as it lives, even through a panic.
@@ -92,11 +95,20 @@ fn event_loop(
     path: &Path,
     out: &mut impl Write,
     color: bool,
+    clipboard: Clipboard,
 ) -> Result<(), String> {
     let modified = || fs::metadata(path).and_then(|m| m.modified()).ok();
     let mut seen: Option<SystemTime> = modified();
     let mut redraw = true;
+    // Copies under way on threads of their own (see `clip`), and how many.
+    let (copied_tx, copied) = mpsc::channel::<(String, Result<(), String>)>();
+    let mut copying = 0;
     loop {
+        while let Ok((what, result)) = copied.try_recv() {
+            copying -= 1;
+            board.copied(&what, result);
+            redraw = true;
+        }
         if redraw {
             let (w, h) = terminal::size().map_err(term_err)?;
             let (lines, cursor) = board.draw(w as usize, h as usize);
@@ -104,7 +116,9 @@ fn event_loop(
             redraw = false;
         }
 
-        if !event::poll(Duration::from_millis(500)).map_err(term_err)? {
+        // While a copy is under way, look for its result more often.
+        let wait = if copying > 0 { 50 } else { 500 };
+        if !event::poll(Duration::from_millis(wait)).map_err(term_err)? {
             // Idle: past midnight, due dates read anew.
             let today = Zoned::now().date();
             if today != board.today {
@@ -131,21 +145,42 @@ fn event_loop(
         if key.kind == KeyEventKind::Release {
             continue;
         }
-        match board.key(key) {
-            Outcome::Quit => return Ok(()),
-            Outcome::Nothing => {}
-            Outcome::Change(op) => {
-                match store::load(path) {
-                    Ok(fresh) => {
-                        board.replace_tasks(fresh);
-                        board.apply(op);
-                        if let Err(e) = store::save(path, &board.tasks) {
-                            board.message = Some(e);
-                        }
+        // A Hangul syllable is several keys: each is done, its change made,
+        // before the next.
+        let mut outcome = board.key(key);
+        loop {
+            match outcome {
+                Outcome::Quit => return Ok(()),
+                Outcome::Nothing => {}
+                Outcome::Copy { text, what } => match &clipboard {
+                    Clipboard::Command { program, args } => {
+                        copying += 1;
+                        let (program, args) = (program.clone(), args.clone());
+                        let done = copied_tx.clone();
+                        clip::spawn(program, args, text, what, clip::LIMIT, done);
                     }
-                    Err(e) => board.message = Some(e),
+                    Clipboard::Terminal => {
+                        let sent = write!(out, "{}", clip::osc52(&text)).and_then(|()| out.flush());
+                        board.sent(&what, sent.map_err(|e| e.to_string()));
+                    }
+                },
+                Outcome::Change(op) => {
+                    match store::load(path) {
+                        Ok(fresh) => {
+                            board.replace_tasks(fresh);
+                            board.apply(op);
+                            if let Err(e) = store::save(path, &board.tasks) {
+                                board.message = Some(e);
+                            }
+                        }
+                        Err(e) => board.message = Some(e),
+                    }
+                    seen = modified();
                 }
-                seen = modified();
+            }
+            match board.next_queued() {
+                Some(next) => outcome = next,
+                None => break,
             }
         }
     }
@@ -157,26 +192,106 @@ pub enum Outcome {
     Nothing,
     /// A change to the tasks, to make and save.
     Change(Op),
+    /// `text` to copy to the clipboard: `what` it is, for the note
+    /// (`"pay rent"`, `3 titles`).
+    Copy {
+        text: String,
+        what: String,
+    },
     Quit,
 }
 
-/// A change to the tasks, by id, so it can be made to the file as it is now.
+/// Said after how a Hangul letter was read, the first time one is: the long
+/// form where it fits, else the short.
+const HANGUL_LATE: [&str; 2] = [
+    "A Korean input may hold a letter until the next key.",
+    "It may run a key late.",
+];
+
+/// A task as the board holds it while it waits on a key: its id, and its
+/// stamp, so a task that took the id meanwhile is never taken for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Ref {
+    pub id: u32,
+    pub stamp: u64,
+}
+
+/// A change to the tasks, by [`Ref`], so it can be made to the file as it is
+/// now. A task whose stamp no longer matches its id is gone, and said to be.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Op {
     /// Set a task's status; `follow` keeps it picked in its new column. A card
     /// set to Done finishes its open sub items.
-    Move { id: u32, to: Status, follow: bool },
+    Move { at: Ref, to: Status, follow: bool },
     /// Move each of these tasks a column left (-1) or right (1) of where it
     /// is; one already at the edge stays. A card moved into Done finishes its
     /// open sub items; one moved out of it reopens none.
-    Shift { ids: Vec<u32>, by: isize },
+    Shift { refs: Vec<Ref>, by: isize },
+    /// Move each of these cards to Todo or Doing (`s`, `t`): out of Done, it
+    /// reopens none of its sub items.
+    Send { refs: Vec<Ref>, to: Status },
     /// Mark each of these tasks done, and the open sub items of those that
     /// are cards.
-    Finish { ids: Vec<u32> },
+    Finish { refs: Vec<Ref> },
     /// Add a task, as a sub item of `parent` when there's one.
-    Add { task: Parsed, parent: Option<u32> },
+    Add { task: Parsed, parent: Option<Ref> },
     /// Change each of these tasks as `halil edit` would.
-    Edit { ids: Vec<u32>, change: Change },
+    Edit { refs: Vec<Ref>, change: Change },
+    /// Remove the `asked` (the picked, or the `marked`), and `with` them
+    /// their cards' sub items, as `halil rm` does.
+    Remove {
+        asked: Vec<Ref>,
+        with: Vec<Ref>,
+        marked: bool,
+    },
+}
+
+/// A removal `x` asked about, in the footer, until the next key answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Removal {
+    asked: Vec<Ref>,
+    with: Vec<Ref>,
+    marked: bool,
+    /// The title, when one task is asked about.
+    title: Option<String>,
+}
+
+impl Removal {
+    /// `Remove 3 "pay rent" and its 2 sub items?`, with the title as given,
+    /// or none.
+    fn question(&self, title: Option<&str>) -> String {
+        let what = match (self.marked, title) {
+            (true, _) => format!("{} marked", self.asked.len()),
+            (false, Some(title)) => format!("{} \"{title}\"", self.asked[0].id),
+            (false, None) => self.asked[0].id.to_string(),
+        };
+        format!(
+            "Remove {what}{}?",
+            with_sub_items(self.with.len(), self.asked.len())
+        )
+    }
+}
+
+/// ` and its 2 sub items`, ` and their 4 sub items`: the sub items going with
+/// `of` tasks, or nothing when there are none.
+fn with_sub_items(n: usize, of: usize) -> String {
+    let whose = if of == 1 { "its" } else { "their" };
+    match n {
+        0 => String::new(),
+        n => format!(" and {whose} {}", task::count_of(n, "sub item")),
+    }
+}
+
+/// `task 3 is gone`, `tasks 3 and 5 are gone`.
+fn gone(ids: &[u32]) -> String {
+    match ids {
+        [id] => format!("task {id} is gone"),
+        [rest @ .., last] => {
+            let rest: Vec<String> = rest.iter().map(u32::to_string).collect();
+            format!("tasks {} and {last} are gone", rest.join(", "))
+        }
+        [] => String::new(),
+    }
 }
 
 pub struct Board {
@@ -186,16 +301,26 @@ pub struct Board {
     row: [usize; 3],
     /// The first card shown in each column, when it has more than fit.
     scroll: [usize; 3],
-    /// The ids of the cards and sub items marked with space, which h, l and d
-    /// act on together.
-    marked: BTreeSet<u32>,
+    /// The cards and sub items marked with space, which h, l, s, t, d, e and
+    /// x act on together: each id, with its stamp.
+    marked: BTreeMap<u32, u64>,
     /// The words being typed after `a`, `A` or `e`.
     input: Option<Input>,
+    /// The removal `x` asked about, waiting on `y`.
+    asking: Option<Removal>,
+    /// The keys a Hangul letter was read as that are still to do, each with
+    /// the jamo it stands for.
+    queued: VecDeque<(KeyEvent, char)>,
+    /// Whether a Hangul letter was read as keys yet, and said so.
+    hangul_said: bool,
     /// An error or a refusal to show until the next key, in red.
     pub message: Option<String>,
     /// A note of what a change did besides what was asked, shown until the
     /// next key in the default foreground, after `message` if there's one.
     pub note: Option<String>,
+    /// How a Hangul letter was read, the first time one is (`ㅓ read as j.`):
+    /// after the note, with what the input method may do (see [`HANGUL_LATE`]).
+    hint: Option<String>,
     /// The day due dates are read from.
     today: Date,
 }
@@ -208,11 +333,53 @@ impl Board {
             col: 0,
             row: [0; 3],
             scroll: [0; 3],
-            marked: BTreeSet::new(),
+            marked: BTreeMap::new(),
             input: None,
+            asking: None,
+            queued: VecDeque::new(),
+            hangul_said: false,
             message: None,
             note: None,
+            hint: None,
         }
+    }
+
+    /// `tasks[i]` as the board holds it.
+    fn held(&self, i: usize) -> Ref {
+        Ref {
+            id: self.tasks[i].id,
+            stamp: self.tasks[i].stamp,
+        }
+    }
+
+    /// The task `at` names, if it's still there: its id, with its stamp.
+    fn find(&self, at: Ref) -> Option<usize> {
+        self.tasks
+            .iter()
+            .position(|t| t.id == at.id && t.stamp == at.stamp)
+    }
+
+    fn is_marked(&self, i: usize) -> bool {
+        self.marked.get(&self.tasks[i].id) == Some(&self.tasks[i].stamp)
+    }
+
+    fn marked_refs(&self) -> Vec<Ref> {
+        self.marked
+            .iter()
+            .map(|(&id, &stamp)| Ref { id, stamp })
+            .collect()
+    }
+
+    /// The ids of the tasks of `refs` still there; the rest are said to be
+    /// gone, a refusal.
+    fn still_there(&mut self, refs: &[Ref]) -> Vec<u32> {
+        let (there, gone_ones): (Vec<Ref>, Vec<Ref>) =
+            refs.iter().partition(|&&r| self.find(r).is_some());
+        if !gone_ones.is_empty() {
+            let ids: Vec<u32> = gone_ones.iter().map(|r| r.id).collect();
+            self.message = Some(gone(&ids));
+        }
+        there.iter().map(|r| r.id).collect()
     }
 
     /// The rows of column `c`, as indices into `tasks`: its cards, each with
@@ -278,11 +445,16 @@ impl Board {
             .unwrap_or(0);
     }
 
-    /// Picks task `id` again, if it's still in column `c`.
-    fn repick(&mut self, id: u32, c: usize) {
-        if self.index(id).is_some_and(|i| self.column(c).contains(&i)) {
-            self.pick(id);
+    /// Picks the task `at` names again, if it's still in column `c`.
+    fn repick(&mut self, at: Ref, c: usize) {
+        if self.find(at).is_some_and(|i| self.column(c).contains(&i)) {
+            self.pick(at.id);
         }
+    }
+
+    /// The picked card or sub item, as the board holds it.
+    fn picked_ref(&self) -> Option<Ref> {
+        self.picked().map(|i| self.held(i))
     }
 
     /// Keeps every column's pick on a card.
@@ -295,42 +467,86 @@ impl Board {
     /// Takes the tasks as they are on disk now, keeping the picked card picked
     /// while it's still in its column, and the marks on the rows still in sight.
     pub fn replace_tasks(&mut self, tasks: Vec<Task>) {
-        let picked = self.picked().map(|i| self.tasks[i].id);
+        let picked = self.picked_ref();
         self.tasks = tasks;
         self.keep_marks_in_sight();
-        if let Some(id) = picked {
-            self.repick(id, self.col);
+        if let Some(at) = picked {
+            self.repick(at, self.col);
         }
         self.clamp();
     }
 
-    /// Drops the marks on tasks that are gone, and on sub items whose card is
-    /// done: folded into its count, out of sight, they're no rows for a key to
-    /// act on.
+    /// Drops the marks on tasks that are gone (a task that took one's id
+    /// meanwhile has another stamp), and on sub items whose card is done:
+    /// folded into its count, out of sight, they're no rows for a key to act
+    /// on.
     fn keep_marks_in_sight(&mut self) {
         let parents = task::parents(&self.tasks);
-        let in_sight: BTreeSet<u32> = (0..self.tasks.len())
+        let in_sight: BTreeSet<Ref> = (0..self.tasks.len())
             .filter(|&i| parents[i].is_none_or(|p| self.tasks[p].status != Status::Done))
-            .map(|i| self.tasks[i].id)
+            .map(|i| self.held(i))
             .collect();
-        self.marked.retain(|id| in_sight.contains(id));
+        self.marked
+            .retain(|&id, &mut stamp| in_sight.contains(&Ref { id, stamp }));
     }
 
     pub fn apply(&mut self, op: Op) {
         match op {
-            Op::Move { id, to, follow } => {
-                match self.tasks.iter_mut().find(|t| t.id == id) {
-                    Some(task) => task.status = to,
-                    None => self.message = Some(format!("task {id} is gone")),
-                }
-                if to == Status::Done {
-                    self.finish_sub_items(&[id]);
-                }
-                if follow {
-                    self.pick(id);
+            Op::Move { at, to, follow } => {
+                if let Some(i) = self.find(at) {
+                    self.tasks[i].status = to;
+                    if to == Status::Done {
+                        self.finish_sub_items(&[at.id]);
+                    }
+                    if follow {
+                        self.pick(at.id);
+                    }
+                } else {
+                    self.message = Some(gone(&[at.id]));
                 }
             }
-            Op::Shift { ids, by } => {
+            Op::Send { refs, to } => {
+                let picked = self.picked_ref();
+                let ids = self.still_there(&refs);
+                let parents = task::parents(&self.tasks);
+                for (task, parent) in self.tasks.iter_mut().zip(parents) {
+                    if parent.is_none() && ids.contains(&task.id) {
+                        task.status = to;
+                    }
+                }
+                // As `d`: the pick stays on its row, the next card under it.
+                if let Some(at) = picked {
+                    self.repick(at, self.col);
+                }
+            }
+            Op::Remove {
+                asked,
+                with,
+                marked,
+            } => {
+                let ids = self.still_there(&asked);
+                // Its sub items go with a card that's still there; one gone
+                // meanwhile goes unsaid, as asked.
+                let with: Vec<u32> = with
+                    .iter()
+                    .filter_map(|&r| self.find(r))
+                    .filter(|&i| self.tasks[i].parent.is_some_and(|p| ids.contains(&p)))
+                    .map(|i| self.tasks[i].id)
+                    .collect();
+                self.tasks
+                    .retain(|t| !ids.contains(&t.id) && !with.contains(&t.id));
+                if !ids.is_empty() {
+                    let what = match marked {
+                        true => format!("{} marked", ids.len()),
+                        false => ids[0].to_string(),
+                    };
+                    let subs = with_sub_items(with.len(), ids.len());
+                    self.note = Some(format!("Removed {what}{subs}."));
+                }
+                // The pick stays on its row, clamped below.
+            }
+            Op::Shift { refs, by } => {
+                let ids = self.still_there(&refs);
                 let picked = self.picked().map(|i| self.tasks[i].id);
                 // A sub item moves with its card, never by itself.
                 let parents = task::parents(&self.tasks);
@@ -351,17 +567,19 @@ impl Board {
                     self.pick(id);
                 }
             }
-            Op::Finish { ids } => {
-                let picked = self.picked().map(|i| self.tasks[i].id);
+            Op::Finish { refs } => {
+                let ids = self.still_there(&refs);
+                let picked = self.picked_ref();
                 for task in self.tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
                     task.status = Status::Done;
                 }
                 self.finish_sub_items(&ids);
-                if let Some(id) = picked {
-                    self.repick(id, self.col);
+                if let Some(at) = picked {
+                    self.repick(at, self.col);
                 }
             }
-            Op::Edit { ids, change } => {
+            Op::Edit { refs, change } => {
+                let ids = self.still_there(&refs);
                 // The picked card stays picked, wherever it sorts now.
                 let picked = self.picked().map(|i| self.tasks[i].id);
                 for task in self.tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
@@ -379,14 +597,18 @@ impl Board {
                 // rm` elsewhere): it's a task of its own then, never one under
                 // a gone id, which `next_id` could hand to itself. The add
                 // happens, another way: a note, not a refusal.
+                // A card that took its id meanwhile is another card: it's gone
+                // just the same.
                 let parent = match parent {
-                    Some(p) if self.index(p).is_none() => {
+                    Some(p) if self.find(p).is_none() => {
+                        let p = p.id;
                         self.note = Some(format!("{p} is gone: added as a task of its own."));
                         None
                     }
-                    parent => parent,
+                    parent => parent.map(|p| p.id),
                 };
                 let id = task::next_id(&self.tasks);
+                let stamp = task::new_stamp(&self.tasks, task::now_ms());
                 self.tasks.push(Task {
                     id,
                     title: parsed.title,
@@ -395,6 +617,7 @@ impl Board {
                     tags: parsed.tags,
                     due: parsed.due,
                     parent,
+                    stamp,
                 });
                 self.pick(id);
             }
@@ -441,13 +664,55 @@ impl Board {
         task::parents(&self.tasks)[i].is_some()
     }
 
+    /// What a key asks. A Hangul letter is read as the keys it sits on: the
+    /// first is done here, and the rest wait for [`Board::next_queued`].
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
         self.message = None;
         self.note = None;
-        if self.input.is_some() {
+        self.hint = None;
+        self.queued.clear();
+        self.step(key, None)
+    }
+
+    /// The next key a Hangul letter was read as, once the change of the one
+    /// before it is made; `None` when there's none left.
+    pub fn next_queued(&mut self) -> Option<Outcome> {
+        let (key, jamo) = self.queued.pop_front()?;
+        Some(self.step(key, Some(jamo)))
+    }
+
+    /// One key, `jamo` the Hangul letter it was read from, if it was.
+    fn step(&mut self, key: KeyEvent, jamo: Option<char>) -> Outcome {
+        if let Some(input) = self.input.as_mut() {
+            // Where words are typed, Hangul is words: what's left of a letter
+            // whose first key opened the input goes in as it was typed.
+            if let Some(jamo) = jamo {
+                input.text.insert(input.cursor, jamo);
+                input.cursor += jamo.len_utf8();
+                return Outcome::Nothing;
+            }
             return self.input_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let KeyCode::Char(c) = key.code
+            && !ctrl
+            && let Some(keys) = hangul::keys(c)
+        {
+            if !self.hangul_said {
+                self.hangul_said = true;
+                let read: Vec<String> = keys.iter().map(|(k, _)| k.to_string()).collect();
+                self.hint = Some(format!("{c} read as {}.", read.join(" ")));
+            }
+            let mut keys = keys
+                .into_iter()
+                .map(|(k, j)| (KeyEvent::from(KeyCode::Char(k)), j));
+            let (first, jamo) = keys.next().expect("a letter is a key at least");
+            self.queued.extend(keys);
+            return self.step(first, Some(jamo));
+        }
+        if let Some(removal) = self.asking.take() {
+            return self.answer(removal, key);
+        }
         let last = self.column(self.col).len().saturating_sub(1);
         match key.code {
             KeyCode::Char('c') if ctrl => return Outcome::Quit,
@@ -463,9 +728,9 @@ impl Board {
             }
             KeyCode::Char(' ') => {
                 if let Some(i) = self.picked() {
-                    let id = self.tasks[i].id;
-                    if !self.marked.remove(&id) {
-                        self.marked.insert(id);
+                    let Ref { id, stamp } = self.held(i);
+                    if self.marked.remove(&id) != Some(stamp) {
+                        self.marked.insert(id, stamp);
                     }
                     self.row[self.col] = (self.row[self.col] + 1).min(last);
                 }
@@ -484,16 +749,20 @@ impl Board {
             KeyCode::BackTab => self.col = (self.col + COLUMNS.len() - 1) % COLUMNS.len(),
             KeyCode::Char('h') => return self.shift(-1),
             KeyCode::Char('l') => return self.shift(1),
+            KeyCode::Char('s') => return self.send(Status::Doing),
+            KeyCode::Char('t') => return self.send(Status::Todo),
             KeyCode::Char('d') => return self.finish(),
+            KeyCode::Char('x') | KeyCode::Delete => self.ask_removal(),
+            KeyCode::Char('y') => return self.copy(),
             KeyCode::Char('a') => self.input = Some(Input::new(InputKind::Add, String::new())),
             KeyCode::Char('A') => {
                 if let Some(i) = self.picked() {
-                    let card = &self.tasks[task::parents(&self.tasks)[i].unwrap_or(i)];
-                    if task::is_sub_item(&self.tasks, card) {
-                        self.message =
-                            Some(format!("{} is a sub item: they go one level deep", card.id));
+                    let card = task::parents(&self.tasks)[i].unwrap_or(i);
+                    if task::is_sub_item(&self.tasks, &self.tasks[card]) {
+                        let id = self.tasks[card].id;
+                        self.message = Some(format!("{id} is a sub item: they go one level deep"));
                     } else {
-                        let kind = InputKind::Sub(card.id);
+                        let kind = InputKind::Sub(self.held(card));
                         self.input = Some(Input::new(kind, String::new()));
                     }
                 }
@@ -502,14 +771,158 @@ impl Board {
                 if !self.marked.is_empty() {
                     self.input = Some(Input::new(InputKind::EditMarked, String::new()));
                 } else if let Some(i) = self.picked() {
-                    let task = &self.tasks[i];
-                    let kind = InputKind::Edit(task.id);
-                    self.input = Some(Input::new(kind, task.title.clone()));
+                    let kind = InputKind::Edit(self.held(i));
+                    self.input = Some(Input::new(kind, self.tasks[i].title.clone()));
                 }
             }
             _ => {}
         }
         Outcome::Nothing
+    }
+
+    /// `y`: the picked row's title to copy, or each marked row's, one a line,
+    /// in the board's order (by column, then row).
+    fn copy(&mut self) -> Outcome {
+        let titles: Vec<&str> = match self.marked.is_empty() {
+            true => self
+                .picked()
+                .map(|i| self.tasks[i].title.as_str())
+                .into_iter()
+                .collect(),
+            false => (0..COLUMNS.len())
+                .flat_map(|c| self.column(c))
+                .filter(|&i| self.is_marked(i))
+                .map(|i| self.tasks[i].title.as_str())
+                .collect(),
+        };
+        let what = match titles[..] {
+            [] => return Outcome::Nothing,
+            [title] => format!("\"{title}\""),
+            _ => format!("{} titles", titles.len()),
+        };
+        Outcome::Copy {
+            text: titles.join("\n"),
+            what,
+        }
+    }
+
+    /// A copy command's result for `what` it copied: a note when it ended
+    /// well, a refusal when it didn't.
+    pub fn copied(&mut self, what: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.note = Some(format!("Copied {what}.")),
+            Err(e) => self.message = Some(format!("couldn't copy {what}: {e}")),
+        }
+    }
+
+    /// The clipboard sequence sent for `what`: whether the terminal took it,
+    /// halil can't know.
+    pub fn sent(&mut self, what: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.note = Some(format!("Sent {what} to the terminal's clipboard.")),
+            Err(e) => self.message = Some(format!("couldn't copy {what}: {e}")),
+        }
+    }
+
+    /// `x`: asks, in the footer, to remove the marked, or else the picked
+    /// card with its sub items, or the picked sub item alone.
+    fn ask_removal(&mut self) {
+        let (asked, marked): (Vec<usize>, bool) = match self.picked() {
+            _ if !self.marked.is_empty() => (
+                (0..self.tasks.len())
+                    .filter(|&i| self.is_marked(i))
+                    .collect(),
+                true,
+            ),
+            Some(i) => (vec![i], false),
+            None => return,
+        };
+        // A sub item marked under a marked card is counted once, as marked.
+        let parents = task::parents(&self.tasks);
+        let with: Vec<usize> = (0..self.tasks.len())
+            .filter(|&i| !asked.contains(&i) && parents[i].is_some_and(|p| asked.contains(&p)))
+            .collect();
+        self.asking = Some(Removal {
+            asked: asked.iter().map(|&i| self.held(i)).collect(),
+            with: with.iter().map(|&i| self.held(i)).collect(),
+            marked,
+            title: (!marked).then(|| self.tasks[asked[0]].title.clone()),
+        });
+    }
+
+    /// The key after `x`: `y` or enter removes, any other keeps.
+    fn answer(&mut self, removal: Removal, key: KeyEvent) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter if !ctrl => {
+                if removal.marked {
+                    self.marked.clear();
+                }
+                Outcome::Change(Op::Remove {
+                    asked: removal.asked,
+                    with: removal.with,
+                    marked: removal.marked,
+                })
+            }
+            KeyCode::Char('c') if ctrl => Outcome::Quit,
+            _ => {
+                self.note = Some("Nothing was removed.".into());
+                Outcome::Nothing
+            }
+        }
+    }
+
+    /// `s` and `t`: sends the marked cards, or else the picked one, to Doing
+    /// or Todo. A sub item moves with its card only, as for `h` and `l`.
+    fn send(&mut self, to: Status) -> Outcome {
+        const WITH_ITS_TASK: &str = "a sub item moves with its task";
+        let parents = task::parents(&self.tasks);
+        let column = status_name(to);
+        if !self.marked.is_empty() {
+            let marked = |i: usize| self.is_marked(i);
+            let cards: Vec<usize> = (0..self.tasks.len())
+                .filter(|&i| marked(i) && parents[i].is_none())
+                .collect();
+            let stayed = (0..self.tasks.len())
+                .filter(|&i| marked(i) && parents[i].is_some_and(|p| !marked(p)))
+                .count();
+            if stayed > 0 {
+                let n = task::count_of(stayed, "sub item");
+                self.message = Some(format!("{n} stayed: {WITH_ITS_TASK}"));
+            }
+            let going: Vec<Ref> = cards
+                .iter()
+                .filter(|&&i| self.tasks[i].status != to)
+                .map(|&i| self.held(i))
+                .collect();
+            if going.is_empty() {
+                // Short, to fit beside a sub item's staying: `2 are in Todo
+                // already.`, or one card by its id, as when it's picked.
+                self.note = match cards[..] {
+                    [] => None,
+                    [i] => Some(format!("{} is in {column} already.", self.tasks[i].id)),
+                    _ => Some(format!("{} are in {column} already.", cards.len())),
+                };
+                return Outcome::Nothing;
+            }
+            return Outcome::Change(Op::Send { refs: going, to });
+        }
+        match self.picked() {
+            Some(i) if parents[i].is_some() => {
+                self.message = Some(WITH_ITS_TASK.into());
+                Outcome::Nothing
+            }
+            Some(i) if self.tasks[i].status == to => {
+                let id = self.tasks[i].id;
+                self.note = Some(format!("{id} is in {column} already."));
+                Outcome::Nothing
+            }
+            Some(i) => Outcome::Change(Op::Send {
+                refs: vec![self.held(i)],
+                to,
+            }),
+            None => Outcome::Nothing,
+        }
     }
 
     /// Moves the marked cards, or else the picked one, a column left (-1) or
@@ -519,7 +932,7 @@ impl Board {
         const WITH_ITS_TASK: &str = "a sub item moves with its task";
         let parents = task::parents(&self.tasks);
         if !self.marked.is_empty() {
-            let marked = |i: usize| self.marked.contains(&self.tasks[i].id);
+            let marked = |i: usize| self.is_marked(i);
             let cards: Vec<usize> = (0..self.tasks.len())
                 .filter(|&i| marked(i) && parents[i].is_none())
                 .collect();
@@ -535,9 +948,9 @@ impl Board {
                 .any(|&i| shifted(self.tasks[i].status, by).is_some());
             return match moves {
                 true => {
-                    let mut ids: Vec<u32> = cards.iter().map(|&i| self.tasks[i].id).collect();
-                    ids.sort_unstable();
-                    Outcome::Change(Op::Shift { ids, by })
+                    let mut refs: Vec<Ref> = cards.iter().map(|&i| self.held(i)).collect();
+                    refs.sort_unstable();
+                    Outcome::Change(Op::Shift { refs, by })
                 }
                 false => Outcome::Nothing,
             };
@@ -552,7 +965,7 @@ impl Board {
             .filter(|&c| c < COLUMNS.len());
         match (self.picked(), to) {
             (Some(i), Some(to)) => Outcome::Change(Op::Move {
-                id: self.tasks[i].id,
+                at: self.held(i),
                 to: COLUMNS[to],
                 follow: true,
             }),
@@ -564,25 +977,29 @@ impl Board {
     /// the picked card; a card's open sub items with it. A picked sub item is
     /// marked done, or opened again when it's done.
     fn finish(&mut self) -> Outcome {
-        let ids: Vec<u32> = match self.picked() {
-            _ if !self.marked.is_empty() => std::mem::take(&mut self.marked).into_iter().collect(),
+        let refs: Vec<Ref> = match self.picked() {
+            _ if !self.marked.is_empty() => {
+                let refs = self.marked_refs();
+                self.marked.clear();
+                refs
+            }
             Some(i) if self.is_sub(i) => {
-                let task = &self.tasks[i];
-                let to = match task.status {
+                let to = match self.tasks[i].status {
                     Status::Done => Status::Todo,
                     _ => Status::Done,
                 };
                 return Outcome::Change(Op::Move {
-                    id: task.id,
+                    at: self.held(i),
                     to,
                     follow: true,
                 });
             }
-            Some(i) => vec![self.tasks[i].id],
+            Some(i) => vec![self.held(i)],
             None => return Outcome::Nothing,
         };
+        let ids: Vec<u32> = refs.iter().map(|r| r.id).collect();
         match self.finishing(&ids).is_empty() {
-            false => Outcome::Change(Op::Finish { ids }),
+            false => Outcome::Change(Op::Finish { refs }),
             true => Outcome::Nothing,
         }
     }
@@ -652,11 +1069,24 @@ impl Board {
             };
         }
 
-        let ids: Vec<u32> = match kind {
-            InputKind::Edit(id) => vec![id],
-            _ => self.marked.iter().copied().collect(),
+        let refs: Vec<Ref> = match kind {
+            InputKind::Edit(at) => vec![at],
+            _ => self.marked_refs(),
         };
-        let tasks: Vec<&Task> = self.tasks.iter().filter(|t| ids.contains(&t.id)).collect();
+        // The task went while its words were typed (a `halil rm` elsewhere,
+        // maybe with another task in its id since): nothing to change.
+        if let InputKind::Edit(at) = kind
+            && self.find(at).is_none()
+        {
+            self.input = None;
+            self.message = Some(gone(&[at.id]));
+            return Outcome::Nothing;
+        }
+        let tasks: Vec<&Task> = refs
+            .iter()
+            .filter_map(|&r| self.find(r))
+            .map(|i| &self.tasks[i])
+            .collect();
         // `e` on one fills in its title, which is read again: a `-tag` that's
         // a word of that title went in as one (the task hadn't the tag then),
         // and stays one, or an untouched enter would take the tag off. When
@@ -676,7 +1106,7 @@ impl Board {
             })
         };
         let change = match kind {
-            InputKind::Edit(id) => {
+            InputKind::Edit(Ref { id, .. }) => {
                 read(true).and_then(|c| match parse::refuse_missing_tags(id, &c) {
                     Ok(()) => Ok(c),
                     Err(_) => {
@@ -707,7 +1137,7 @@ impl Board {
         });
         self.input = None;
         match changes {
-            true => Outcome::Change(Op::Edit { ids, change }),
+            true => Outcome::Change(Op::Edit { refs, change }),
             false => Outcome::Nothing,
         }
     }
@@ -727,14 +1157,50 @@ impl Board {
         let body_h = h - 5;
         let columns: Vec<Vec<usize>> = (0..COLUMNS.len()).map(|c| self.column(c)).collect();
         let parents = task::parents(&self.tasks);
-        for (c, cards) in columns.iter().enumerate() {
-            let s = &mut self.scroll[c];
-            *s = (*s)
-                .min(self.row[c])
-                .max((self.row[c] + 1).saturating_sub(body_h));
-            *s = (*s).min(cards.len().saturating_sub(body_h));
-        }
         let x = |c: usize| MARGIN + c * (col_w + GAP);
+        let edge = x(COLUMNS.len() - 1) + col_w;
+        // Each column's rows, drawn: the picked one, shown whole, may run
+        // over the columns to its right, or take more than a line, and the
+        // column scrolls to show it; the rest are one line each.
+        let mut cells: Vec<Vec<Row>> = Vec::new();
+        for (c, rows) in columns.iter().enumerate() {
+            let drawn = |n: usize| {
+                let i = rows[n];
+                let look = Look {
+                    width: col_w,
+                    room: edge - x(c),
+                    picked: c == self.col && n == self.row[c],
+                    marked: self.is_marked(i),
+                    today: self.today,
+                };
+                if parents[i].is_some() {
+                    sub_item(&self.tasks[i], look)
+                } else {
+                    let subs = task::sub_items(&self.tasks, &parents, i);
+                    let count = task::progress(&self.tasks, &subs);
+                    card(&self.tasks[i], count.as_deref(), look)
+                }
+            };
+            let pick = self.row[c];
+            let tall = if pick < rows.len() {
+                drawn(pick).len()
+            } else {
+                1
+            };
+            let mut s = self.scroll[c].min(pick);
+            s = s.max((pick + tall).saturating_sub(body_h)).min(pick);
+            s = s.min((rows.len() + tall - 1).saturating_sub(body_h));
+            let mut lines = Vec::new();
+            for n in s..rows.len() {
+                if lines.len() >= body_h {
+                    break;
+                }
+                lines.extend(drawn(n));
+            }
+            lines.truncate(body_h);
+            self.scroll[c] = s;
+            cells.push(lines);
+        }
 
         let mut lines = vec![Line::new()];
 
@@ -756,27 +1222,11 @@ impl Board {
         for r in 0..body_h {
             let mut row = Row::default();
             for (c, cards) in columns.iter().enumerate() {
-                row.pad_to(x(c), Style::default());
-                let n = self.scroll[c] + r;
-                if let Some(&i) = cards.get(n) {
-                    let task = &self.tasks[i];
-                    let picked = c == self.col && n == self.row[c];
-                    let marked = self.marked.contains(&task.id);
-                    let look = Look {
-                        width: col_w,
-                        picked,
-                        marked,
-                        today: self.today,
-                    };
-                    if parents[i].is_some() {
-                        sub_item(&mut row, task, look);
-                    } else {
-                        let subs = task::sub_items(&self.tasks, &parents, i);
-                        let count = task::progress(&self.tasks, &subs);
-                        card(&mut row, task, count.as_deref(), look);
-                    }
+                let mut cell = Row::default();
+                if let Some(line) = cells[c].get(r) {
+                    cell = line.clone();
                 } else if r == 0 && cards.is_empty() {
-                    row.push(
+                    cell.push(
                         "   Nothing here",
                         Style {
                             italic: true,
@@ -784,18 +1234,40 @@ impl Board {
                         },
                     );
                 }
+                // A neighbour's row is whole or not there: where a picked row
+                // shown whole reaches into this column, its row on this line
+                // isn't drawn, never cut to what's past the ground.
+                if row.width <= x(c) {
+                    row.pad_to(x(c), Style::default());
+                    row.append(&cell);
+                }
             }
             lines.push(row.spans);
         }
 
         // A refusal in red, then a note of what was done in the terminal's
-        // own colour, three cells after it.
+        // own colour, three cells after it, and how a Hangul letter was read.
         let mut message = Row::default();
+        let gap = |message: &Row| if message.width == 0 { 2 } else { 3 };
+        let hint = self.hint.as_ref().map(|read| {
+            let mut taken = Row::default();
+            for said in [&self.message, &self.note].into_iter().flatten() {
+                taken.pad_to(taken.width + gap(&taken), Style::default());
+                taken.push(said, Style::default());
+            }
+            let room = w.saturating_sub(taken.width + gap(&taken));
+            let long = format!("{read} {}", HANGUL_LATE[0]);
+            match long.width() <= room {
+                true => long,
+                false => format!("{read} {}", HANGUL_LATE[1]),
+            }
+        });
         for (said, style) in [
             (&self.message, Style::fg(RED)),
             (&self.note, Style::default()),
+            (&hint, Style::default()),
         ] {
-            let gap = if message.width == 0 { 2 } else { 3 };
+            let gap = gap(&message);
             if let Some(said) = said
                 && message.width + gap < w
             {
@@ -815,13 +1287,13 @@ impl Board {
                         "enter to add · esc to cancel",
                         "title friday +tag !high",
                     ),
-                    InputKind::Sub(id) => (
-                        format!("Sub item of {id}"),
+                    InputKind::Sub(at) => (
+                        format!("Sub item of {}", at.id),
                         "enter to add · esc to cancel",
                         "title friday +tag !high",
                     ),
-                    InputKind::Edit(id) => (
-                        format!("Edit {id}"),
+                    InputKind::Edit(at) => (
+                        format!("Edit {}", at.id),
                         "enter to change · esc to cancel",
                         "title friday +tag -tag !high",
                     ),
@@ -848,16 +1320,51 @@ impl Board {
                     footer.push(hint, Style::fg(QUIETER));
                 }
             }
+            None if self.asking.is_some() => {
+                let removal = self.asking.as_ref().expect("asking");
+                footer.push("  ", Style::default());
+                // The title is cut to fit, or left out when little of it
+                // would; then the answers' keys give way; then it's cut.
+                let answers = "   y remove · esc keep".width();
+                let room = w.saturating_sub(footer.width + answers);
+                let question = match &removal.title {
+                    Some(title) => {
+                        let bare = removal.question(Some("")).width();
+                        match room.checked_sub(bare) {
+                            Some(left) if left >= title.width().min(6) => {
+                                removal.question(Some(&truncate(title, left)))
+                            }
+                            _ => removal.question(None),
+                        }
+                    }
+                    None => removal.question(None),
+                };
+                footer.push(
+                    &truncate(&question, w.saturating_sub(footer.width)),
+                    Style::default(),
+                );
+                if footer.width + answers <= w {
+                    footer.push("   ", Style::default());
+                    footer.push("y", Style::fg(QUIET));
+                    footer.push(" remove · ", Style::fg(QUIETER));
+                    footer.push("esc", Style::fg(QUIET));
+                    footer.push(" keep", Style::fg(QUIETER));
+                }
+            }
             None if !self.marked.is_empty() => {
                 footer.push(
                     &truncate(&format!("  {} marked", self.marked.len()), w),
                     Style::default(),
                 );
-                // `esc clear` gives way first, then `e`, then `h l`; `d` never.
+                // `esc clear` gives way first, then `t`, `x` and `s`, then
+                // `e`, then `h l`; `d` last.
                 let hints = [
-                    ("h l", "move", Some(3)),
-                    ("e", "edit", Some(2)),
+                    ("h l", "move", Some(6)),
+                    ("t", "todo", Some(2)),
+                    ("s", "doing", Some(4)),
                     ("d", "done", None),
+                    ("e", "edit", Some(5)),
+                    ("x", "remove", Some(3)),
                     ("esc", "clear", Some(1)),
                 ];
                 for (keys, what) in giving_way(&hints, w.saturating_sub(footer.width), 4) {
@@ -869,21 +1376,37 @@ impl Board {
             None => {
                 // When they don't all fit, the keys give way by need: `tab`
                 // first (the arrows go between columns too), then `q` (`esc`
-                // quits too), then `j k`, and only then the rest. `d` never
-                // goes, nor its word for what it does to the picked row.
+                // quits too), then `j k`, then `t`, `x` and `s`, and only then
+                // the rest. `d` goes last, and its word for what it does to
+                // the picked row with it.
                 let sub = self.picked().is_some_and(|i| parents[i].is_some());
                 footer.push(" ", Style::default());
-                let hints = [
-                    ("j k", "pick", Some(3)),
-                    ("space", "mark", Some(5)),
-                    ("h l", "move", Some(8)),
-                    ("tab", "column", Some(1)),
-                    ("a", "add", Some(7)),
-                    ("A", "sub", Some(4)),
-                    ("e", "edit", Some(6)),
+                let mut hints = vec![
+                    ("j k", "pick", Some(4)),
+                    ("space", "mark", Some(9)),
+                    ("h l", "move", Some(12)),
+                    ("t", "todo", Some(5)),
+                    ("s", "doing", Some(7)),
                     ("d", if sub { "done/open" } else { "done" }, None),
-                    ("q", "quit", Some(2)),
+                    ("tab", "column", Some(1)),
+                    ("a", "add", Some(11)),
+                    ("A", "sub", Some(8)),
+                    ("e", "edit", Some(10)),
+                    ("y", "copy", Some(2)),
+                    ("x", "remove", Some(6)),
+                    ("q", "quit", Some(3)),
                 ];
+                // Only the keys that act on what's picked: not the key to the
+                // column it's in (in Done, `d` moves it back to Todo, as `t`
+                // says), and none that moves it on a sub item, which moves
+                // with its card only.
+                hints.retain(|&(keys, _, _)| match keys {
+                    "h l" | "t" | "s" if sub => false,
+                    "t" => COLUMNS[self.col] != Status::Todo,
+                    "s" => COLUMNS[self.col] != Status::Doing,
+                    "d" => COLUMNS[self.col] != Status::Done,
+                    _ => true,
+                });
                 for (keys, what) in giving_way(&hints, w.saturating_sub(footer.width), 3) {
                     footer.push(&format!(" {keys} "), Style::fg(QUIET));
                     footer.push(&format!("{what} "), Style::fg(QUIETER));
@@ -904,25 +1427,47 @@ fn giving_way<'a>(
     room: usize,
     extra: usize,
 ) -> Vec<(&'a str, &'a str)> {
-    let width = |&(keys, what, _): &(&str, &str, Option<u8>)| extra + keys.width() + what.width();
-    let mut shown = hints.to_vec();
-    while shown.iter().map(width).sum::<usize>() > room {
-        let Some(next) = (0..shown.len())
-            .filter(|&i| shown[i].2.is_some())
-            .min_by_key(|&i| shown[i].2)
+    let width = |i: usize| {
+        let (keys, what, _) = hints[i];
+        extra + keys.width() + what.width()
+    };
+    let mut shown = vec![true; hints.len()];
+    let used = |shown: &[bool]| {
+        (0..hints.len())
+            .filter(|&i| shown[i])
+            .map(width)
+            .sum::<usize>()
+    };
+    let mut gone = Vec::new();
+    while used(&shown) > room {
+        let Some(next) = (0..hints.len())
+            .filter(|&i| shown[i] && hints[i].2.is_some())
+            .min_by_key(|&i| hints[i].2)
         else {
             break;
         };
-        shown.remove(next);
+        shown[next] = false;
+        gone.push(next);
     }
-    let mut used = 0;
-    shown
-        .iter()
-        .take_while(|hint| {
-            used += width(hint);
-            used <= room
+    // The room left goes back to those gone, the last to go first: one that
+    // doesn't fit is skipped, and the next tried.
+    for &i in gone.iter().rev() {
+        if used(&shown) + width(i) <= room {
+            shown[i] = true;
+        }
+    }
+    // Those that never give way, when even they don't all fit: each that does.
+    let mut taken = 0;
+    (0..hints.len())
+        .filter(|&i| shown[i])
+        .filter(|&i| {
+            let fits = taken + width(i) <= room;
+            if fits {
+                taken += width(i);
+            }
+            fits
         })
-        .map(|&(keys, what, _)| (keys, what))
+        .map(|i| (hints[i].0, hints[i].1))
         .collect()
 }
 
@@ -973,11 +1518,13 @@ fn due_in_words(days: i64) -> String {
     }
 }
 
-/// How a card or sub item is drawn: how wide, picked or marked, and the day
-/// its due date is read from.
+/// How a card or sub item is drawn: how wide its column, and how wide the
+/// room from it to the board's edge (a picked row shown whole may take it),
+/// picked or marked, and the day its due date is read from.
 #[derive(Clone, Copy)]
 struct Look {
     width: usize,
+    room: usize,
     picked: bool,
     marked: bool,
     today: Date,
@@ -1039,20 +1586,42 @@ fn push_due(row: &mut Row, due: Option<(String, bool)>, plain: Style, quiet: Sty
     }
 }
 
-/// One card: a `▌` when it's marked, its priority mark, title, its sub items'
-/// `count` quiet after it, tags dimmed beside them and its due date at the
-/// right. When room is short the tags give way first, then the due date; the
-/// count stays.
-fn card(row: &mut Row, task: &Task, count: Option<&str>, look: Look) {
-    let Look {
-        width,
-        picked,
-        marked,
-        today,
-    } = look;
-    let (plain, title, quiet) = styles(picked);
+/// The width of a due date's words with the two spaces before them, or 0.
+fn due_width(due: &Option<(String, bool)>) -> usize {
+    due.as_ref().map_or(0, |(words, _)| words.width() + 2)
+}
 
-    let start = row.width;
+/// A due date that didn't fit at the right of the first row: at the right of
+/// the last, two cells after what's there, when it fits; else on a row of its
+/// own, at the right, under the rest of the picked row.
+fn place_late_due(
+    rows: &mut Vec<Row>,
+    due: (String, bool),
+    width: usize,
+    plain: Style,
+    quiet: Style,
+) {
+    let last = rows.last_mut().expect("a row grown has its first line");
+    let words_w = due.0.width();
+    if last.width + 2 + words_w < width {
+        last.pad_to(width - 1 - words_w - 2, plain);
+        push_due(last, Some(due), plain, quiet);
+        return;
+    }
+    let words = truncate(&due.0, width.saturating_sub(3));
+    let mut row = Row::default();
+    row.pad_to(width.saturating_sub(words.width() + 3), plain);
+    push_due(&mut row, Some((words, due.1)), plain, quiet);
+    rows.push(row);
+}
+
+/// A task's due date in words, and whether it's late, while it's open.
+fn due_words(task: &Task, today: Date) -> Option<(String, bool)> {
+    due_in_days(task, today).map(|days| (due_in_words(days), days < 0))
+}
+
+/// A card's first cells: a `▌` when it's marked, its priority mark, a space.
+fn card_head(row: &mut Row, task: &Task, marked: bool, plain: Style) {
     bar(row, marked, plain);
     match task.priority {
         Some(p) => row.push(
@@ -1065,66 +1634,292 @@ fn card(row: &mut Row, task: &Task, count: Option<&str>, look: Look) {
         None => row.push(" ", plain),
     }
     row.push(" ", plain);
-
-    // Room inside the card: a space of padding at each end, the mark and its space.
-    let inner = width.saturating_sub(4);
-    let count_w = count.map_or(0, |c| c.width() + 2);
-    let due = due_fitting(task, today, inner, count_w);
-    let room = inner - due.as_ref().map_or(0, |(words, _)| words.width() + 2);
-
-    let shown = truncate(&task.title, room.saturating_sub(count_w));
-    row.push(&shown, title);
-    if let Some(count) = count {
-        row.push("  ", plain);
-        row.push(count, quiet);
-    }
-    let used = shown.width() + count_w;
-    if !task.tags.is_empty() && room >= used + 2 + 3 {
-        let tags: Vec<String> = task.tags.iter().map(|t| format!("+{t}")).collect();
-        row.push("  ", plain);
-        row.push(&truncate(&tags.join(" "), room - used - 2), quiet);
-    }
-    row.pad_to(start + 3 + room, plain);
-    push_due(row, due, plain, quiet);
-    row.pad_to(start + width, plain);
 }
 
-/// Where a sub item's `◦` goes: two cells further in than a card's title.
-const SUB_INDENT: usize = 5;
-
-/// One sub item, under its card: a `▌` when it's marked, `◦ title` while
-/// it's open or `● title` dimmed once it's done, and its due date at the right
-/// when it fits.
-fn sub_item(row: &mut Row, task: &Task, look: Look) {
+/// One card, as its lines: a `▌` when it's marked, its priority mark, title,
+/// its sub items' `count` quiet after it, tags dimmed beside them and its due
+/// date at the right. When room is short the tags give way first, then the
+/// due date; the count stays. Picked, when any of it was cut or left out, it's
+/// shown whole instead (see [`whole_row`]).
+fn card(task: &Task, count: Option<&str>, look: Look) -> Vec<Row> {
     let Look {
         width,
         picked,
         marked,
         today,
+        ..
+    } = look;
+    let (plain, title, quiet) = styles(picked);
+
+    // Room inside the card: a space of padding at each end, the mark and its space.
+    let inner = width.saturating_sub(4);
+    let count_w = count.map_or(0, |c| c.width() + 2);
+    let due = due_fitting(task, today, inner, count_w);
+    let room = inner - due_width(&due);
+    let tags = (!task.tags.is_empty()).then(|| {
+        let tags: Vec<String> = task.tags.iter().map(|t| format!("+{t}")).collect();
+        tags.join(" ")
+    });
+
+    let shown = truncate(&task.title, room.saturating_sub(count_w));
+    let used = shown.width() + count_w;
+    let whole = shown == task.title
+        && tags.as_ref().is_none_or(|t| used + 2 + t.width() <= room)
+        && (due.is_some() || due_in_days(task, today).is_none());
+    if picked && !whole {
+        let mut head = Row::default();
+        card_head(&mut head, task, marked, plain);
+        let whole = Whole {
+            title: &task.title,
+            title_style: title,
+            count,
+            tags,
+            due: due_words(task, today),
+        };
+        return whole_row(head, whole, look, 4, quiet);
+    }
+
+    let mut row = Row::default();
+    card_head(&mut row, task, marked, plain);
+    row.push(&shown, title);
+    if let Some(count) = count {
+        row.push("  ", plain);
+        row.push(count, quiet);
+    }
+    if let Some(tags) = tags
+        && room >= used + 2 + 3
+    {
+        row.push("  ", plain);
+        row.push(&truncate(&tags, room - used - 2), quiet);
+    }
+    row.pad_to(3 + room, plain);
+    push_due(&mut row, due, plain, quiet);
+    row.pad_to(width, plain);
+    vec![row]
+}
+
+/// What a picked row shows whole, besides its head.
+struct Whole<'a> {
+    title: &'a str,
+    title_style: Style,
+    count: Option<&'a str>,
+    tags: Option<String>,
+    due: Option<(String, bool)>,
+}
+
+/// The picked row whole. On one line when it fits in the look's `room`, the
+/// width from where the row starts to the board's edge: `head` (the mark and
+/// priority, or the glyph), the title, the count, the tags and the due date,
+/// two cells between each, and the picked ground one cell past them, over the
+/// columns to its right (or to its column's end, when that's further). Else
+/// wrapped in that room (see [`grow`]), `pad` of it being the head and the
+/// cell at the end.
+fn whole_row(head: Row, whole: Whole, look: Look, pad: usize, quiet: Style) -> Vec<Row> {
+    let room = look.room;
+    let plain = styles(true).0;
+    let beside = |s: &Option<String>| s.as_ref().map_or(0, |s| s.width() + 2);
+    let line = head.width
+        + whole.title.width()
+        + beside(&whole.count.map(String::from))
+        + beside(&whole.tags)
+        + due_width(&whole.due);
+    if line < room {
+        let mut row = head;
+        row.push(whole.title, whole.title_style);
+        for said in [whole.count.map(String::from), whole.tags]
+            .into_iter()
+            .flatten()
+        {
+            row.push("  ", plain);
+            row.push(&said, quiet);
+        }
+        push_due(&mut row, whole.due, plain, quiet);
+        row.push(" ", plain);
+        // Short enough for its column (its date was left out there only to
+        // keep room for the title): the ground to the column's end, as ever.
+        row.pad_to(look.width, plain);
+        return vec![row];
+    }
+    grow(head, room.saturating_sub(pad), room, whole, plain, quiet)
+}
+
+/// A picked card or sub item whole, over as many lines as it takes, `width`
+/// wide with `inner` of it for words. The first line is `head` (the mark and
+/// priority, or the glyph), the title and the count, and keeps a due date
+/// that fits there beside 8 cells of title, as on one line; the title wraps by
+/// words under itself, a word longer than the room broken; the tags follow
+/// the title's last line when they fit there, else take lines of their own; a
+/// due date with no room on the first line goes at the right of the last, or
+/// else on a line of its own.
+fn grow(
+    head: Row,
+    inner: usize,
+    width: usize,
+    whole: Whole,
+    plain: Style,
+    quiet: Style,
+) -> Vec<Row> {
+    let indent = head.width;
+    let count_w = whole.count.map_or(0, |c| c.width() + 2);
+    let (first_due, last_due) = match whole.due {
+        Some((words, late)) if words.width() + 2 + count_w + 8 <= inner => {
+            (Some((words, late)), None)
+        }
+        due => (None, due),
+    };
+    let room = inner - due_width(&first_due);
+    let lines = wrap(whole.title, room.saturating_sub(count_w), inner);
+
+    let last = lines.len() - 1;
+    let tags_after = whole.tags.as_ref().is_some_and(|t| {
+        let (used, room) = match last {
+            0 => (lines[0].width() + count_w, room),
+            _ => (lines[last].width(), inner),
+        };
+        used + 2 + t.width() <= room
+    });
+    let mut rows = Vec::new();
+    for (k, line) in lines.iter().enumerate() {
+        let mut row = match k {
+            0 => head.clone(),
+            _ => Row::default(),
+        };
+        row.pad_to(indent, plain);
+        row.push(line, whole.title_style);
+        if k == 0
+            && let Some(count) = whole.count
+        {
+            row.push("  ", plain);
+            row.push(count, quiet);
+        }
+        if k == last
+            && tags_after
+            && let Some(tags) = &whole.tags
+        {
+            row.push("  ", plain);
+            row.push(tags, quiet);
+        }
+        if k == 0 && first_due.is_some() {
+            row.pad_to(indent + room, plain);
+            push_due(&mut row, first_due.clone(), plain, quiet);
+        }
+        rows.push(row);
+    }
+    if let Some(tags) = whole.tags.filter(|_| !tags_after) {
+        for line in wrap(&tags, inner, inner) {
+            let mut row = Row::default();
+            row.pad_to(indent, plain);
+            row.push(&line, quiet);
+            rows.push(row);
+        }
+    }
+    if let Some(due) = last_due {
+        place_late_due(&mut rows, due, width, plain, quiet);
+    }
+    for row in &mut rows {
+        row.pad_to(width, plain);
+    }
+    rows
+}
+
+/// Where a sub item's `◦` goes: two cells further in than a card's title.
+const SUB_INDENT: usize = 5;
+
+/// One sub item, under its card, as its lines: a `▌` when it's marked, `◦
+/// title` while it's open or `● title` dimmed once it's done, and its due date
+/// at the right when it fits. Picked, it shows its tags too, after the title;
+/// when they don't fit there, or its title was cut or its date left out, it's
+/// shown whole, as a card is, from its own indent.
+fn sub_item(task: &Task, look: Look) -> Vec<Row> {
+    let Look {
+        width,
+        picked,
+        marked,
+        today,
+        ..
     } = look;
     let (plain, title, quiet) = styles(picked);
     let done = task.status == Status::Done;
+    let title = if done { quiet } else { title };
 
-    let start = row.width;
-    bar(row, marked, plain);
-    row.pad_to(start + SUB_INDENT, plain);
-    row.push(if done { "●" } else { "◦" }, quiet);
-    row.push(" ", plain);
+    let mut head = Row::default();
+    bar(&mut head, marked, plain);
+    head.pad_to(SUB_INDENT, plain);
+    head.push(if done { "●" } else { "◦" }, quiet);
+    head.push(" ", plain);
 
     // Room after the glyph and its space, a space of padding at the end.
     let inner = width.saturating_sub(SUB_INDENT + 3);
     let due = due_fitting(task, today, inner, 0);
-    let room = inner - due.as_ref().map_or(0, |(words, _)| words.width() + 2);
-    row.push(
-        &truncate(&task.title, room),
-        if done { quiet } else { title },
-    );
-    row.pad_to(start + SUB_INDENT + 2 + room, plain);
-    push_due(row, due, plain, quiet);
-    row.pad_to(start + width, plain);
+    let room = inner - due_width(&due);
+    let shown = truncate(&task.title, room);
+    let tags = (picked && !task.tags.is_empty()).then(|| {
+        let tags: Vec<String> = task.tags.iter().map(|t| format!("+{t}")).collect();
+        tags.join(" ")
+    });
+    let whole = shown == task.title
+        && tags
+            .as_ref()
+            .is_none_or(|t| shown.width() + 2 + t.width() <= room)
+        && (due.is_some() || due_in_days(task, today).is_none());
+    if picked && !whole {
+        let whole = Whole {
+            title: &task.title,
+            title_style: title,
+            count: None,
+            tags,
+            due: due_words(task, today),
+        };
+        return whole_row(head, whole, look, SUB_INDENT + 3, quiet);
+    }
+
+    let mut row = head;
+    row.push(&shown, title);
+    if let Some(tags) = tags {
+        row.push("  ", plain);
+        row.push(&tags, quiet);
+    }
+    row.pad_to(SUB_INDENT + 2 + room, plain);
+    push_due(&mut row, due, plain, quiet);
+    row.pad_to(width, plain);
+    vec![row]
 }
 
-/// `s` cut to `max` columns, an ellipsis marking the cut.
+/// `s` in lines by words, the first `first` columns wide and the rest `rest`
+/// wide. A word goes to the next line when it doesn't fit on this one; one
+/// longer than its line is broken, as it is when it doesn't fit the first.
+fn wrap(s: &str, first: usize, rest: usize) -> Vec<String> {
+    let room = |line: usize| if line == 0 { first } else { rest };
+    let mut lines = vec![String::new()];
+    let mut width = 0;
+    for word in s.split_whitespace() {
+        let word_w = word.width();
+        let at = lines.len() - 1;
+        if width > 0 && width + 1 + word_w <= room(at) {
+            lines[at].push(' ');
+            lines[at] += word;
+            width += 1 + word_w;
+            continue;
+        }
+        if width > 0 {
+            lines.push(String::new());
+            width = 0;
+        }
+        for ch in word.chars() {
+            let w = ch.width().unwrap_or(0);
+            if width + w > room(lines.len() - 1) && (width > 0 || lines.len() == 1) {
+                lines.push(String::new());
+                width = 0;
+            }
+            lines.last_mut().expect("a line").push(ch);
+            width += w;
+        }
+    }
+    lines
+}
+
+/// `s` cut to `max` columns, an ellipsis marking the cut, right after the
+/// last letter kept.
 fn truncate(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.into();
@@ -1139,6 +1934,7 @@ fn truncate(s: &str, max: usize) -> String {
         out.push(ch);
         width += w;
     }
+    out.truncate(out.trim_end().len());
     if max > 0 {
         out.push('…');
     }
@@ -1154,13 +1950,13 @@ struct Input {
     cursor: usize,
 }
 
-/// What the input is for: a new task, a new sub item of a card (by id), the
-/// picked card or sub item (by id), or the marked ones.
+/// What the input is for: a new task, a new sub item of a card, the picked
+/// card or sub item, or the marked ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputKind {
     Add,
-    Sub(u32),
-    Edit(u32),
+    Sub(Ref),
+    Edit(Ref),
     EditMarked,
 }
 
@@ -1254,7 +2050,7 @@ struct Span {
 type Line = Vec<Span>;
 
 /// A line being built, and how many columns wide it is so far.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Row {
     spans: Line,
     width: usize,
@@ -1276,6 +2072,11 @@ impl Row {
         if width > self.width {
             self.push(&" ".repeat(width - self.width), style);
         }
+    }
+
+    fn append(&mut self, other: &Row) {
+        self.spans.extend(other.spans.iter().cloned());
+        self.width += other.width;
     }
 }
 
@@ -1352,7 +2153,22 @@ mod tests {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             due: None,
             parent: None,
+            stamp: 0,
         }
+    }
+
+    /// Task `id` as the board holds it: the tests' tasks have no stamps.
+    fn r(id: u32) -> Ref {
+        Ref { id, stamp: 0 }
+    }
+
+    fn refs(ids: &[u32]) -> Vec<Ref> {
+        ids.iter().map(|&id| r(id)).collect()
+    }
+
+    /// The ids marked.
+    fn marks(board: &Board) -> BTreeSet<u32> {
+        board.marked.keys().copied().collect()
     }
 
     /// The day the tests' boards read due dates from: Wednesday 2026-11-11.
@@ -1385,17 +2201,31 @@ mod tests {
         )
     }
 
+    /// Presses the keys, a Hangul letter's keys each in turn: what each asked.
     fn press(board: &mut Board, keys: &str) -> Vec<Outcome> {
-        keys.chars()
-            .map(|c| board.key(KeyEvent::from(KeyCode::Char(c))))
-            .collect()
+        let mut outcomes = Vec::new();
+        for c in keys.chars() {
+            outcomes.push(board.key(KeyEvent::from(KeyCode::Char(c))));
+            while let Some(next) = board.next_queued() {
+                outcomes.push(next);
+            }
+        }
+        outcomes
     }
 
-    /// Presses the keys, making each change as the loop does.
+    /// Presses the keys, making each change as the loop does, before the next
+    /// key, a Hangul letter's too.
     fn run_keys(board: &mut Board, keys: &str) {
         for c in keys.chars() {
-            if let Outcome::Change(op) = board.key(KeyEvent::from(KeyCode::Char(c))) {
-                board.apply(op);
+            let mut outcome = board.key(KeyEvent::from(KeyCode::Char(c)));
+            loop {
+                if let Outcome::Change(op) = outcome {
+                    board.apply(op);
+                }
+                match board.next_queued() {
+                    Some(next) => outcome = next,
+                    None => break,
+                }
             }
         }
     }
@@ -1607,7 +2437,7 @@ mod tests {
     #[test]
     fn the_picked_card_is_highlighted_and_its_mark_colored() {
         let mut board = sample();
-        let (lines, _) = board.draw(80, 12);
+        let (lines, _) = board.draw(100, 12);
         let highlighted: Vec<&Span> = lines[3]
             .iter()
             .filter(|s| s.style.bg == Some(HIGHLIGHT))
@@ -1615,7 +2445,7 @@ mod tests {
         let width: usize = highlighted.iter().map(|s| s.text.width()).sum();
         assert_eq!(
             width,
-            (80 - 2 * MARGIN - 2 * GAP) / 3,
+            (100 - 2 * MARGIN - 2 * GAP) / 3,
             "the whole card, no more"
         );
         let mark = lines[3].iter().find(|s| s.text == "•").unwrap();
@@ -1635,6 +2465,8 @@ mod tests {
             )],
             today(),
         );
+        // Not picked: the picked row shows whole.
+        board.key(KeyEvent::from(KeyCode::Tab));
         let (lines, _) = board.draw(60, 10);
         let row = text(&lines[3]);
         let col_w = (60 - 2 * MARGIN - 2 * GAP) / 3;
@@ -1678,13 +2510,13 @@ mod tests {
     fn space_marks_or_unmarks_the_card_and_steps_down_but_not_off_the_end() {
         let mut board = sample();
         press(&mut board, " ");
-        assert_eq!(board.marked, BTreeSet::from([2]));
+        assert_eq!(marks(&board), BTreeSet::from([2]));
         assert_eq!(picked_id(&board), Some(1));
         press(&mut board, " ");
-        assert_eq!(board.marked, BTreeSet::from([1, 2]));
+        assert_eq!(marks(&board), BTreeSet::from([1, 2]));
         assert_eq!(picked_id(&board), Some(1), "it stays on the last row");
         press(&mut board, " ");
-        assert_eq!(board.marked, BTreeSet::from([2]));
+        assert_eq!(marks(&board), BTreeSet::from([2]));
         press(&mut board, "k ");
         assert!(board.marked.is_empty());
         assert_eq!(picked_id(&board), Some(1));
@@ -1727,13 +2559,13 @@ mod tests {
     #[test]
     fn marks_hold_across_columns_and_reloads_and_a_gone_id_drops_out() {
         let mut board = marked_sample();
-        assert_eq!(board.marked, BTreeSet::from([2, 3]));
+        assert_eq!(marks(&board), BTreeSet::from([2, 3]));
         board.key(KeyEvent::from(KeyCode::BackTab));
-        assert_eq!(board.marked, BTreeSet::from([2, 3]));
+        assert_eq!(marks(&board), BTreeSet::from([2, 3]));
         // Meanwhile another `halil` deleted fix bike.
         let fresh = sample().tasks.into_iter().filter(|t| t.id != 3).collect();
         board.replace_tasks(fresh);
-        assert_eq!(board.marked, BTreeSet::from([2]));
+        assert_eq!(marks(&board), BTreeSet::from([2]));
         let (lines, _) = board.draw(100, 12);
         let footer = text(&lines[11]);
         assert!(footer.trim_start().starts_with("1 marked"), "{footer:?}");
@@ -1744,16 +2576,16 @@ mod tests {
         // Pay rent (2), its sub item 6 and buy milk (1) marked.
         let mut board = sub_sample();
         press(&mut board, " j j ");
-        assert_eq!(board.marked, BTreeSet::from([1, 2, 6]));
+        assert_eq!(marks(&board), BTreeSet::from([1, 2, 6]));
         run_keys(&mut board, "l");
         assert_eq!(
-            board.marked,
+            marks(&board),
             BTreeSet::from([1, 2, 6]),
             "in Doing, 6 is in sight under its card"
         );
         run_keys(&mut board, "l");
         assert_eq!(
-            board.marked,
+            marks(&board),
             BTreeSet::from([1, 2]),
             "in Done, 6 is folded into the count: no row for d to act on"
         );
@@ -1763,7 +2595,7 @@ mod tests {
         // Meanwhile a `halil done 2` elsewhere: the reload drops 6's mark.
         let mut board = sub_sample();
         press(&mut board, "jj ");
-        assert_eq!(board.marked, BTreeSet::from([6]));
+        assert_eq!(marks(&board), BTreeSet::from([6]));
         let mut fresh = sub_sample().tasks;
         for t in fresh
             .iter_mut()
@@ -1784,7 +2616,7 @@ mod tests {
         assert_eq!(
             *op,
             Op::Shift {
-                ids: vec![2, 3],
+                refs: refs(&[2, 3]),
                 by: 1
             }
         );
@@ -1792,7 +2624,7 @@ mod tests {
         let mut fresh = sample().tasks;
         fresh[1].status = Status::Doing;
         board.replace_tasks(fresh);
-        board.apply(std::mem::replace(op, Op::Finish { ids: vec![] }));
+        board.apply(std::mem::replace(op, Op::Finish { refs: vec![] }));
         assert_eq!(status(&board, 2), Status::Done);
         assert_eq!(status(&board, 3), Status::Done);
         assert_eq!(status(&board, 1), Status::Todo, "unmarked stays");
@@ -1811,7 +2643,9 @@ mod tests {
         let mut board = marked_sample();
         assert_eq!(
             press(&mut board, "d"),
-            [Outcome::Change(Op::Finish { ids: vec![2, 3] })]
+            [Outcome::Change(Op::Finish {
+                refs: refs(&[2, 3])
+            })]
         );
     }
 
@@ -1821,7 +2655,7 @@ mod tests {
         run_keys(&mut board, "ll");
         assert_eq!(status(&board, 2), Status::Done);
         assert_eq!(status(&board, 3), Status::Done);
-        assert_eq!(board.marked, BTreeSet::from([2, 3]));
+        assert_eq!(marks(&board), BTreeSet::from([2, 3]));
         run_keys(&mut board, "hh");
         assert_eq!(status(&board, 2), Status::Todo);
         assert_eq!(status(&board, 3), Status::Todo);
@@ -1847,11 +2681,11 @@ mod tests {
         let mut board = marked_sample();
         board.key(KeyEvent::from(KeyCode::BackTab));
         press(&mut board, " ");
-        assert_eq!(board.marked, BTreeSet::from([1, 2, 3]));
+        assert_eq!(marks(&board), BTreeSet::from([1, 2, 3]));
         let (lines, _) = board.draw(100, 12);
         assert_eq!(
             text(&lines[11]).trim_start(),
-            "3 marked   h l move   e edit   d done   esc clear"
+            "3 marked   h l move   t todo   s doing   d done   e edit   x remove   esc clear"
         );
     }
 
@@ -2232,6 +3066,7 @@ mod tests {
         );
         assert_eq!(ids(&board, 1), [3]);
         assert_eq!(ids(&board, 2), [4]);
+        board.key(KeyEvent::from(KeyCode::Tab));
         let (lines, _) = board.draw(100, 14);
         let heading = text(&lines[1]);
         assert!(
@@ -2245,6 +3080,8 @@ mod tests {
     #[test]
     fn a_sub_item_is_a_row_two_cells_in_open_or_done_and_dimmed() {
         let mut board = sub_sample();
+        // Pay rent not picked: picked, its tags would take a line of their own.
+        board.key(KeyEvent::from(KeyCode::Tab));
         let (lines, _) = board.draw(100, 14);
         let rows: Vec<String> = lines[3..7].iter().map(|l| cell(l, 100, 0)).collect();
         assert!(rows[0].starts_with(" • pay rent  1/3"), "{rows:?}");
@@ -2267,6 +3104,7 @@ mod tests {
         );
         assert_eq!(style(&lines[5], "set up the transfer").fg, None);
         assert!(lines[5].iter().all(|s| s.style.bg.is_none()));
+        board.key(KeyEvent::from(KeyCode::BackTab));
         press(&mut board, "jj");
         let (lines, _) = board.draw(100, 14);
         assert_eq!(
@@ -2324,18 +3162,16 @@ mod tests {
             (70, "   ship 0.2.0  2/4  "),
             (46, "   sh…  2/4 "),
         ] {
+            // Not picked: one line, cut to fit.
+            board.col = 1;
             let (lines, _) = board.draw(w, 12);
             assert_eq!(cell(&lines[3], w, 0), want, "{w} wide");
-            let card: usize = lines[3]
-                .iter()
-                .filter(|s| s.style.bg == Some(HIGHLIGHT))
-                .map(|s| s.text.width())
-                .sum();
-            assert_eq!(
-                card,
-                (w - 2 * MARGIN - 2 * GAP) / 3,
-                "{w} wide: its column, no more"
-            );
+            // Picked: its column wide when it fits there, else whole on
+            // the line, `ship 0.2.0  2/4  +work  tomorrow` (35) and a cell.
+            board.col = 0;
+            let (lines, _) = board.draw(w, 12);
+            let col_w = (w - 2 * MARGIN - 2 * GAP) / 3;
+            assert_eq!(lit(&lines[3]), col_w.max(36), "{w} wide");
         }
         let (lines, _) = board.draw(100, 12);
         let count = lines[3].iter().find(|s| s.text == "2/4").unwrap();
@@ -2393,7 +3229,7 @@ mod tests {
         assert_eq!(
             press(&mut board, "d"),
             [Outcome::Change(Op::Move {
-                id: 5,
+                at: r(5),
                 to: Status::Todo,
                 follow: true
             })]
@@ -2414,7 +3250,7 @@ mod tests {
         let [Outcome::Change(op)] = &mut press(&mut board, "d")[..] else {
             panic!("d is one change");
         };
-        board.apply(std::mem::replace(op, Op::Finish { ids: vec![] }));
+        board.apply(std::mem::replace(op, Op::Finish { refs: vec![] }));
         for id in [2, 5, 6, 7] {
             assert_eq!(status(&board, id), Status::Done, "{id}");
         }
@@ -2476,14 +3312,14 @@ mod tests {
     fn marked_sub_items_take_d_and_stay_put_for_h_and_l() {
         let mut board = sub_sample();
         press(&mut board, "jj ");
-        assert_eq!(board.marked, BTreeSet::from([6]));
+        assert_eq!(marks(&board), BTreeSet::from([6]));
         assert_eq!(picked_id(&board), Some(7), "space steps a row");
         press(&mut board, "j ");
-        assert_eq!(board.marked, BTreeSet::from([1, 6]));
+        assert_eq!(marks(&board), BTreeSet::from([1, 6]));
         assert_eq!(
             press(&mut board, "l"),
             [Outcome::Change(Op::Shift {
-                ids: vec![1],
+                refs: refs(&[1]),
                 by: 1
             })]
         );
@@ -2493,7 +3329,9 @@ mod tests {
         );
         assert_eq!(
             press(&mut board, "d"),
-            [Outcome::Change(Op::Finish { ids: vec![1, 6] })]
+            [Outcome::Change(Op::Finish {
+                refs: refs(&[1, 6])
+            })]
         );
 
         // Only sub items marked: nothing moves. Marked with its card: it goes along.
@@ -2509,7 +3347,7 @@ mod tests {
         );
         let mut board = sub_sample();
         press(&mut board, "  ");
-        assert_eq!(board.marked, BTreeSet::from([2, 5]));
+        assert_eq!(marks(&board), BTreeSet::from([2, 5]));
         run_keys(&mut board, "l");
         assert_eq!(board.message, None);
         assert_eq!(ids(&board, 1), [2, 5, 6, 7, 3], "high first");
@@ -2538,7 +3376,7 @@ mod tests {
         let [Outcome::Change(op)] = &mut press(&mut board, "l")[..] else {
             panic!("l is one change");
         };
-        board.apply(std::mem::replace(op, Op::Finish { ids: vec![] }));
+        board.apply(std::mem::replace(op, Op::Finish { refs: vec![] }));
         for id in [2, 5, 6, 7] {
             assert_eq!(status(&board, id), Status::Done, "{id}");
         }
@@ -2577,7 +3415,7 @@ mod tests {
         board.key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(ids(&board, 1), [2, 5, 6, 7, 3, 9]);
         press(&mut board, " jjj ");
-        assert_eq!(board.marked, BTreeSet::from([2, 3]));
+        assert_eq!(marks(&board), BTreeSet::from([2, 3]));
         run_keys(&mut board, "l");
         for id in [2, 3, 5, 6, 7, 9] {
             assert_eq!(status(&board, id), Status::Done, "{id}");
@@ -2595,7 +3433,7 @@ mod tests {
         press(&mut board, "jj ");
         board.key(KeyEvent::from(KeyCode::Tab));
         press(&mut board, " ");
-        assert_eq!(board.marked, BTreeSet::from([3, 6]));
+        assert_eq!(marks(&board), BTreeSet::from([3, 6]));
         run_keys(&mut board, "l");
         assert_eq!(
             (status(&board, 3), status(&board, 9), status(&board, 6)),
@@ -2649,7 +3487,7 @@ mod tests {
         press(&mut board, "A");
         assert_eq!(
             board.input.as_ref().map(|i| i.kind),
-            Some(InputKind::Sub(2))
+            Some(InputKind::Sub(r(2)))
         );
         // Meanwhile a `halil rm 2` elsewhere took pay rent and its sub items.
         let fresh = sub_sample()
@@ -2681,9 +3519,11 @@ mod tests {
         // A card like any other: it takes sub items.
         assert_eq!(picked_id(&board), Some(2));
         press(&mut board, "A");
+        let new_two = board.held(board.index(2).unwrap());
+        assert!(new_two.stamp > 0, "stamped when made");
         assert_eq!(
             board.input.as_ref().map(|i| i.kind),
-            Some(InputKind::Sub(2))
+            Some(InputKind::Sub(new_two))
         );
     }
 
@@ -2764,7 +3604,7 @@ mod tests {
         press(&mut board, "kA");
         assert_eq!(
             board.input.as_ref().map(|i| i.kind),
-            Some(InputKind::Sub(2))
+            Some(InputKind::Sub(r(2)))
         );
     }
 
@@ -2775,57 +3615,139 @@ mod tests {
     }
 
     #[test]
-    fn at_80_columns_the_footers_fit_tab_giving_way_first() {
+    fn the_footers_at_120_100_and_80_columns() {
+        // A card in Todo: no t.
         let mut board = sample();
         assert_eq!(
-            footer(&mut board, 100),
-            "  j k pick  space mark  h l move  tab column  a add  A sub  e edit  d done  q quit ",
+            footer(&mut board, 120),
+            "  j k pick  space mark  h l move  s doing  d done  tab column  a add  A sub  e edit  y copy  x remove  q quit ",
             "all of it, where there's room"
         );
         assert_eq!(
+            footer(&mut board, 100),
+            "  j k pick  space mark  h l move  s doing  d done  a add  A sub  e edit  y copy  x remove  q quit ",
+            "tab first"
+        );
+        // tab, y, q and j k give way; then j k, needing 10 of the 8 cells
+        // left, is skipped, and q comes back; y, last, doesn't fit.
+        let (lines, _) = board.draw(90, 12);
+        assert_eq!(
+            text(&lines[11]),
+            "  j k pick  space mark  h l move  s doing  d done  a add  A sub  e edit  x remove  q quit ",
+            "y right after tab"
+        );
+        assert_eq!(
             footer(&mut board, 80),
-            "  j k pick  space mark  h l move  a add  A sub  e edit  d done  q quit "
+            "  space mark  h l move  s doing  d done  a add  A sub  e edit  x remove  q quit "
+        );
+        // In Doing: no s.
+        board.col = 1;
+        assert_eq!(
+            footer(&mut board, 80),
+            "  space mark  h l move  t todo  d done  a add  A sub  e edit  x remove  q quit "
+        );
+        // In Done: no d.
+        board.col = 2;
+        assert_eq!(
+            footer(&mut board, 120),
+            "  j k pick  space mark  h l move  t todo  s doing  tab column  a add  A sub  e edit  y copy  x remove  q quit "
+        );
+        assert_eq!(
+            footer(&mut board, 80),
+            "  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove  q quit "
         );
 
-        // A sub item picked: d's word for it stays, and so does the rest.
+        // A sub item picked: none of h l, t and s; the room brings j k and q
+        // back.
         let mut board = sub_sample();
         press(&mut board, "j");
         assert_eq!(
             footer(&mut board, 80),
-            "  j k pick  space mark  h l move  a add  A sub  e edit  d done/open  q quit "
+            "  j k pick  space mark  d done/open  a add  A sub  e edit  x remove  q quit "
         );
 
         let mut board = marked_sample();
         assert_eq!(
+            footer(&mut board, 100),
+            "  2 marked   h l move   t todo   s doing   d done   e edit   x remove   esc clear"
+        );
+        assert_eq!(
             footer(&mut board, 80),
-            "  2 marked   h l move   e edit   d done   esc clear"
+            "  2 marked   h l move   t todo   s doing   d done   e edit   x remove",
+            "esc clear first"
         );
     }
 
     #[test]
-    fn a_narrow_footer_gives_way_by_need_and_keeps_d() {
-        // tab, then q, then j k; past them the least needed, d never.
+    fn a_narrow_footer_gives_way_by_need_and_d_goes_last() {
+        // tab, q, j k, then t, x and s, then the least needed; d last. The
+        // room left goes back to those gone, the last to go first, one that
+        // doesn't fit skipped.
+        let mut board = sample();
+        board.col = 2;
+        for (w, want) in [
+            (
+                85,
+                "  j k pick  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove ",
+            ),
+            (
+                76,
+                "  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove ",
+            ),
+            (
+                66,
+                "  space mark  h l move  s doing  a add  A sub  e edit  x remove ",
+            ),
+            (56, "  space mark  h l move  s doing  a add  A sub  e edit "),
+            (50, "  space mark  h l move  a add  A sub  e edit "),
+        ] {
+            assert_eq!(footer(&mut board, w), want, "{w} wide, in Done");
+        }
         let mut board = sub_sample();
         press(&mut board, "j");
         for (w, want) in [
             (
-                75,
-                "  j k pick  space mark  h l move  a add  A sub  e edit  d done/open ",
+                76,
+                "  j k pick  space mark  d done/open  a add  A sub  e edit  x remove  q quit ",
             ),
             (
-                67,
-                "  space mark  h l move  a add  A sub  e edit  d done/open ",
+                66,
+                "  space mark  d done/open  a add  A sub  e edit  x remove  q quit ",
             ),
-            (46, "  h l move  a add  e edit  d done/open "),
+            (
+                56,
+                "  space mark  d done/open  a add  A sub  e edit  q quit ",
+            ),
+            (46, "  space mark  d done/open  a add  e edit "),
         ] {
-            assert_eq!(footer(&mut board, w), want, "{w} wide");
+            assert_eq!(footer(&mut board, w), want, "{w} wide, a sub item");
         }
+
+        // Skipped, not the end: j k doesn't fit back, q after it does.
+        let hints = [
+            ("j k", "pick", Some(3)),
+            ("d", "done", None),
+            ("q", "quit", Some(2)),
+        ];
+        assert_eq!(giving_way(&hints, 17, 3), [("d", "done"), ("q", "quit")]);
+        assert_eq!(giving_way(&hints, 26, 3).len(), 3);
+        // Those that never give way, too: one that doesn't fit is skipped.
+        let never = [("space", "mark", None), ("d", "done", None)];
+        assert_eq!(giving_way(&never, 10, 3), [("d", "done")]);
         let mut board = marked_sample();
         assert_eq!(
             footer(&mut board, 46),
-            "  2 marked   h l move   e edit   d done",
-            "esc clear goes first"
+            "  2 marked   h l move   d done   e edit",
+            "esc clear, then t, x and s"
         );
+
+        // Where there's room for one, it's d.
+        let hints = [
+            ("j k", "pick", Some(3)),
+            ("d", "done/open", None),
+            ("a", "add", Some(10)),
+        ];
+        assert_eq!(giving_way(&hints, 13, 3), [("d", "done/open")]);
     }
 
     #[test]
@@ -2833,7 +3755,1333 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("日本語です", 5), "日本…");
+        assert_eq!(
+            truncate("분기 보고서 초안", 13),
+            "분기 보고서…",
+            "no space before the cut"
+        );
         assert_eq!(tail("hello world", 5), "world");
         assert_eq!(tail("日本語", 4), "本語");
+    }
+
+    // The picked row, whole.
+
+    /// A long card with tags, a sub item and a due date, picked; buy milk
+    /// under it; fix bike in Doing.
+    fn long_sample() -> Board {
+        Board::new(
+            vec![
+                due(
+                    task(
+                        1,
+                        "write the quarterly report for the whole team",
+                        Status::Todo,
+                        Some(Priority::High),
+                        &["work", "q4"],
+                    ),
+                    "2026-11-12",
+                ),
+                task(2, "buy milk", Status::Todo, None, &[]),
+                task(3, "fix bike", Status::Doing, None, &[]),
+                sub(task(4, "draft it", Status::Done, None, &[]), 1),
+            ],
+            today(),
+        )
+    }
+
+    /// Column `c` of the body's rows, drawn `w` by `h`, its ends trimmed.
+    fn column_rows(board: &mut Board, w: usize, h: usize, c: usize) -> Vec<String> {
+        let (lines, _) = board.draw(w, h);
+        lines[3..h - 2]
+            .iter()
+            .map(|l| cell(l, w, c).trim_end().to_string())
+            .collect()
+    }
+
+    /// The body's rows, drawn `w` by `h`, whole and trimmed at the end.
+    fn body(board: &mut Board, w: usize, h: usize) -> Vec<String> {
+        let (lines, _) = board.draw(w, h);
+        lines[3..h - 2]
+            .iter()
+            .map(|l| text(l).trim_end().to_string())
+            .collect()
+    }
+
+    /// The cells of a drawn line on the picked ground.
+    fn lit(line: &Line) -> usize {
+        line.iter()
+            .filter(|s| s.style.bg == Some(HIGHLIGHT))
+            .map(|s| s.text.width())
+            .sum()
+    }
+
+    #[test]
+    fn the_picked_row_shows_whole_on_one_line_over_the_columns_to_its_right() {
+        let mut board = long_sample();
+        board
+            .tasks
+            .push(task(5, "call mum", Status::Done, None, &[]));
+        // In order, two cells between: the title whole, count, tags, due
+        // date, not pushed to the far edge; it starts where it always does.
+        // At 80 it runs over all of Doing and Done, fix bike and call mum
+        // under it.
+        let rows = body(&mut board, 80, 14);
+        assert_eq!(
+            rows[..3],
+            [
+                "   • write the quarterly report for the whole team  1/1  +work +q4  tomorrow",
+                "       ● draft it",
+                "     buy milk",
+            ]
+        );
+        let (lines, _) = board.draw(80, 14);
+        assert_eq!(lit(&lines[3]), 75, "the text and one cell past it");
+        assert!(lines[4].iter().all(|s| s.style.bg.is_none()));
+        assert!(!rows[0].contains("fix bike") && !rows[0].contains("call mum"));
+
+        // At 100 it ends inside Done: call mum, in a column it reaches into,
+        // isn't drawn on that line, never cut.
+        let rows = body(&mut board, 100, 14);
+        assert_eq!(
+            rows[0],
+            "   • write the quarterly report for the whole team  1/1  +work +q4  tomorrow"
+        );
+        let (lines, _) = board.draw(100, 14);
+        assert_eq!(
+            lit(&lines[3]),
+            75,
+            "the ground still one cell past the text"
+        );
+        // And the next row of each column is where it was.
+        assert_eq!(cell(&lines[4], 100, 0).trim_end(), "     ● draft it");
+
+        // Not picked: every row in its column, as ever.
+        board.col = 1;
+        let rows = body(&mut board, 100, 14);
+        assert!(rows[0].starts_with("   • write the…  1/1"), "{:?}", rows[0]);
+        assert!(rows[0].contains("fix bike") && rows[0].contains("call mum"));
+    }
+
+    #[test]
+    fn a_picked_row_longer_than_its_room_wraps_in_that_room() {
+        // In Doing the room is two columns: 49 at 80. Longer, it wraps there,
+        // its lines that room's, the due date on the first as on one line.
+        let title = "fix the bike before the weekend ride with the club";
+        let mut board = Board::new(
+            vec![
+                task(1, "buy milk", Status::Todo, None, &[]),
+                due(task(2, title, Status::Doing, None, &["bike"]), "2026-11-12"),
+                task(3, "call mum", Status::Done, None, &[]),
+            ],
+            today(),
+        );
+        board.col = 1;
+        let (lines, _) = board.draw(80, 12);
+        let rows: Vec<String> = lines[3..6]
+            .iter()
+            .map(|l| text(l).trim_end().to_string())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "     buy milk                  fix the bike before the weekend      tomorrow",
+                "                               ride with the club  +bike",
+                "",
+            ]
+        );
+        assert_eq!(lit(&lines[3]), 49);
+        assert_eq!(lit(&lines[4]), 49);
+        assert_eq!(
+            cell(&lines[3], 80, 0).trim_end(),
+            "   buy milk",
+            "Todo untouched"
+        );
+
+        // In Done the room is its own column: under itself, as before.
+        let mut board = Board::new(
+            vec![task(
+                1,
+                "read the whole lease again",
+                Status::Done,
+                None,
+                &[],
+            )],
+            today(),
+        );
+        board.col = 2;
+        let (lines, _) = board.draw(80, 12);
+        assert_eq!(cell(&lines[3], 80, 2).trim_end(), "   read the whole");
+        assert_eq!(cell(&lines[4], 80, 2).trim_end(), "   lease again");
+        assert_eq!(lit(&lines[3]), 23);
+    }
+
+    #[test]
+    fn only_the_picked_row_grows_and_only_when_some_of_it_was_cut() {
+        // Not picked, or picked in a column that isn't, or marked: one line.
+        let mut board = long_sample();
+        press(&mut board, " ");
+        assert_eq!(marks(&board), BTreeSet::from([1]));
+        let rows = column_rows(&mut board, 80, 14, 0);
+        assert_eq!(
+            rows[..3],
+            ["▌• write the qua…  1/1", "     ● draft it", "   buy milk"]
+        );
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, "k");
+        let rows = column_rows(&mut board, 80, 14, 0);
+        assert_eq!(rows[0], "▌• write the qua…  1/1", "its column isn't picked");
+
+        // Picked, with all of it shown: in its column, the ground its width.
+        let mut board = sample();
+        let rows = body(&mut board, 100, 12);
+        assert!(
+            rows[0].starts_with("   • pay rent  +home +money     "),
+            "{:?}",
+            rows[0]
+        );
+        let (lines, _) = board.draw(100, 12);
+        assert_eq!(lit(&lines[3]), 30);
+        // Its tags cut: whole, over the gap, up to fix bike.
+        let (lines, _) = board.draw(80, 12);
+        assert_eq!(
+            text(&lines[3]).trim_end(),
+            "   • pay rent  +home +money  • fix bike                  call mum"
+        );
+        assert_eq!(lit(&lines[3]), 26);
+
+        // A due date left out for want of room, and nothing else: on the
+        // line, two cells after the title.
+        let mut board = Board::new(
+            vec![due(
+                task(1, "tax form", Status::Todo, None, &[]),
+                "2026-12-30",
+            )],
+            today(),
+        );
+        // Into Doing, whose "Nothing here" isn't drawn; Done's is.
+        assert_eq!(
+            body(&mut board, 60, 10)[..2],
+            [
+                "     tax form  in 7 weeks                  Nothing here",
+                ""
+            ]
+        );
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(column_rows(&mut board, 60, 10, 0)[..2], ["   tax form", ""]);
+        // Short enough for its column, it keeps the column's ground.
+        let mut board = Board::new(
+            vec![due(task(1, "x", Status::Todo, None, &[]), "2026-12-30")],
+            today(),
+        );
+        let (lines, _) = board.draw(80, 10);
+        assert_eq!(cell(&lines[3], 80, 0), "   x  in 7 weeks       ");
+        assert_eq!(lit(&lines[3]), 23);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_room_breaks_and_the_rest_wrap_by_words() {
+        assert_eq!(wrap("pay the rent", 8, 8), ["pay the", "rent"]);
+        assert_eq!(
+            wrap("call supercalifragilistic now", 10, 10),
+            ["call", "supercalif", "ragilistic", "now"]
+        );
+        // The first line narrower: a first word too long for it breaks there.
+        assert_eq!(wrap("shipping it", 3, 8), ["shi", "pping it"]);
+        assert_eq!(wrap("x", 0, 8), ["", "x"]);
+        // Columns, not bytes: a wide letter that doesn't fit goes on.
+        assert_eq!(
+            wrap("보고서 작성하기 금요일까지", 9, 9),
+            ["보고서", "작성하기", "금요일까", "지"]
+        );
+        assert_eq!(wrap("", 5, 5), [""]);
+    }
+
+    #[test]
+    fn a_picked_sub_item_shows_whole_at_its_own_indent() {
+        let mut board = sub_sample();
+        board.tasks.push(due(
+            sub(
+                task(
+                    9,
+                    "ring the landlord about the boiler",
+                    Status::Todo,
+                    None,
+                    &[],
+                ),
+                2,
+            ),
+            "2026-11-13",
+        ));
+        // Not picked: cut, its date left out.
+        board.key(KeyEvent::from(KeyCode::Tab));
+        let rows = column_rows(&mut board, 80, 16, 0);
+        assert_eq!(rows[4], "     ◦ ring the landl…");
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        press(&mut board, "jjjj");
+        assert_eq!(picked_id(&board), Some(9));
+        // From its own indent, on one line.
+        let rows = body(&mut board, 80, 16);
+        assert_eq!(
+            rows[3..6],
+            [
+                "       ◦ find the iban",
+                "       ◦ ring the landlord about the boiler  in 2 days",
+                "     buy milk",
+            ]
+        );
+        let (lines, _) = board.draw(80, 16);
+        assert_eq!(
+            lit(&lines[7]),
+            53,
+            "7 of head, 34 of title, 11 of date, a cell"
+        );
+    }
+
+    #[test]
+    fn the_column_scrolls_so_the_grown_card_is_in_view_and_no_other_moves() {
+        // In Done, where a long row wraps under itself.
+        let mut tasks: Vec<Task> = (1..=7)
+            .map(|id| task(id, &format!("task {id}"), Status::Done, None, &[]))
+            .collect();
+        tasks.push(task(
+            8,
+            "the last one has a title that takes three lines",
+            Status::Done,
+            None,
+            &[],
+        ));
+        tasks.extend((9..=16).map(|id| task(id, &format!("todo {id}"), Status::Todo, None, &[])));
+        let mut board = Board::new(tasks, today());
+        board.col = 2;
+        press(&mut board, "G");
+        // Five rows of body: two cards above, then the last one whole.
+        assert_eq!(
+            column_rows(&mut board, 80, 10, 2),
+            [
+                "   task 6",
+                "   task 7",
+                "   the last one has a",
+                "   title that takes",
+                "   three lines",
+            ]
+        );
+        assert_eq!(
+            column_rows(&mut board, 80, 10, 0)[0],
+            "   todo 9",
+            "Todo stays put"
+        );
+        // The pick a line again, the column fills down to its end.
+        press(&mut board, "k");
+        assert_eq!(
+            column_rows(&mut board, 80, 10, 2)[3..],
+            ["   task 7", "   the last one has a…"]
+        );
+        press(&mut board, "g");
+        assert_eq!(column_rows(&mut board, 80, 10, 2)[0], "   task 1");
+    }
+
+    #[test]
+    fn a_left_out_due_date_goes_right_of_the_last_line_else_on_its_own() {
+        // A row wrapped 23 wide, as in a narrow Done, or a room too narrow
+        // for the date beside 8 cells of title.
+        let grown = |title: &str, tags: Option<&str>| -> Vec<String> {
+            let (plain, title_style, quiet) = styles(true);
+            let mut head = Row::default();
+            head.push("   ", plain);
+            let whole = Whole {
+                title,
+                title_style,
+                count: None,
+                tags: tags.map(String::from),
+                due: Some(("in 7 weeks".into(), false)),
+            };
+            grow(head, 19, 23, whole, plain, quiet)
+                .iter()
+                .map(|r| text(&r.spans).trim_end().to_string())
+                .collect()
+        };
+        // Beside the title's last line, two cells or more between.
+        assert_eq!(
+            grown("renew the passport soon", None),
+            ["   renew the passport", "   soon     in 7 weeks"]
+        );
+        // Beside the tags, exactly two between; one cell short of that, a
+        // line of its own.
+        assert_eq!(
+            grown("renew the passport", Some("+travel")),
+            ["   renew the passport", "   +travel  in 7 weeks"]
+        );
+        assert_eq!(
+            grown("renew the passport", Some("+travels")),
+            [
+                "   renew the passport",
+                "   +travels",
+                "            in 7 weeks"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_picked_sub_item_shows_its_tags_and_grows_for_them() {
+        let mut board = sub_sample();
+        board.tasks[6].tags = vec!["bank".into()];
+        assert_eq!(board.tasks[6].id, 6);
+        // Not picked: no tags, as ever.
+        assert_eq!(
+            column_rows(&mut board, 120, 14, 0)[2],
+            "     ◦ set up the transfer"
+        );
+        press(&mut board, "jj");
+        // Picked, where they fit beside the title: one line.
+        assert_eq!(
+            column_rows(&mut board, 120, 14, 0)[2..4],
+            ["     ◦ set up the transfer  +bank", "     ◦ find the iban"]
+        );
+        // Where they don't: on the line still, over the gap to its right.
+        assert_eq!(
+            body(&mut board, 100, 14)[2..4],
+            [
+                "       ◦ set up the transfer  +bank",
+                "       ◦ find the iban"
+            ]
+        );
+        let (lines, _) = board.draw(100, 14);
+        assert_eq!(lit(&lines[5]), 34);
+        // Marked and not picked: none.
+        press(&mut board, " ");
+        assert_eq!(
+            column_rows(&mut board, 120, 14, 0)[2],
+            "▌    ◦ set up the transfer"
+        );
+    }
+
+    #[test]
+    fn the_footer_shows_only_the_keys_that_act_on_whats_picked() {
+        let shown = |board: &mut Board| -> Vec<String> {
+            let f = footer(board, 200);
+            ["h l move", "t todo", "s doing", "d done", "x remove"]
+                .into_iter()
+                .filter(|k| f.contains(&format!(" {k} ")))
+                .map(String::from)
+                .collect()
+        };
+        let mut board = sub_sample();
+        assert_eq!(
+            shown(&mut board),
+            ["h l move", "s doing", "d done", "x remove"],
+            "Todo: no t"
+        );
+        press(&mut board, "j");
+        assert_eq!(
+            shown(&mut board),
+            ["x remove"],
+            "a sub item: none that moves it"
+        );
+        assert!(footer(&mut board, 200).contains(" d done/open "));
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(
+            shown(&mut board),
+            ["h l move", "t todo", "d done", "x remove"],
+            "Doing: no s"
+        );
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(
+            shown(&mut board),
+            ["h l move", "t todo", "s doing", "x remove"],
+            "Done: t and s, no d"
+        );
+        // The key still does what it did in 0.2.0 there: nothing on a done
+        // card, and finishes the open sub items of one that has them.
+        assert_eq!(picked_id(&board), Some(4));
+        assert_eq!(press(&mut board, "d"), [Outcome::Nothing]);
+        board
+            .tasks
+            .push(sub(task(9, "ring", Status::Todo, None, &[]), 4));
+        run_keys(&mut board, "d");
+        assert_eq!(status(&board, 9), Status::Done);
+        assert_eq!(status(&board, 4), Status::Done);
+        // Marked: all of them, whatever's picked.
+        let mut board = sub_sample();
+        press(&mut board, " ");
+        let f = footer(&mut board, 200);
+        for k in ["h l move", "t todo", "s doing", "d done", "x remove"] {
+            assert!(f.contains(k), "{k}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn a_neighbours_row_is_whole_or_not_there_never_cut() {
+        // The footer-80 frame that showed `x bike`: pay rent with its count
+        // and tags reaches into Doing; Done it doesn't reach.
+        let mut board = sub_sample();
+        board.tasks[3] = task(4, "call mum", Status::Done, None, &[]);
+        let (lines, _) = board.draw(80, 14);
+        let rows: Vec<String> = lines[3..6]
+            .iter()
+            .map(|l| text(l).trim_end().to_string())
+            .collect();
+        assert_eq!(
+            rows[0], "   • pay rent  1/3  +home +money                         call mum",
+            "Doing's row not there, Done's whole"
+        );
+        assert_eq!(
+            cell(&lines[3], 80, 2).trim_end(),
+            "   call mum",
+            "in its place"
+        );
+        assert_eq!(lit(&lines[3]), 31, "the ground one cell past the text");
+        assert!(
+            rows[1].starts_with("       ● ask for the bi…"),
+            "{:?}",
+            rows[1]
+        );
+        assert!(!rows.iter().any(|r| r.contains("x bike")));
+
+        // A Korean title in Doing under a Todo row shown whole: not there,
+        // and no letter cut in half; the column it doesn't reach is drawn.
+        let mut board = Board::new(
+            vec![
+                task(
+                    1,
+                    "write the quarterly report",
+                    Status::Todo,
+                    None,
+                    &["work"],
+                ),
+                task(2, "분기 보고서 초안", Status::Doing, None, &[]),
+            ],
+            today(),
+        );
+        let rows = body(&mut board, 80, 10);
+        assert_eq!(
+            rows[0],
+            "     write the quarterly report  +work                   Nothing here"
+        );
+        let (lines, _) = board.draw(80, 10);
+        assert_eq!(cell(&lines[3], 80, 2).trim_end(), "   Nothing here");
+        // Not picked, it's there, whole.
+        board.col = 1;
+        assert!(body(&mut board, 80, 10)[0].contains("분기 보고서 초안"));
+    }
+
+    // Copying.
+
+    #[test]
+    fn y_copies_the_picked_rows_title_and_with_marks_each_marked_one_a_line() {
+        let mut board = sub_sample();
+        assert_eq!(
+            press(&mut board, "y"),
+            [Outcome::Copy {
+                text: "pay rent".into(),
+                what: "\"pay rent\"".into()
+            }]
+        );
+        // A sub item's own title; ㅛ is y.
+        press(&mut board, "jj");
+        assert_eq!(
+            press(&mut board, "ㅛ"),
+            [Outcome::Copy {
+                text: "set up the transfer".into(),
+                what: "\"set up the transfer\"".into()
+            }]
+        );
+        // Marked: in the board's order, by column then row, whatever the
+        // order they were marked in; the marks stay.
+        let mut board = sub_sample();
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, " ");
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        press(&mut board, "jjjj ");
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        board.col = 0;
+        board.row[0] = 0;
+        press(&mut board, "jj ");
+        assert_eq!(marks(&board), BTreeSet::from([1, 3, 6]));
+        assert_eq!(
+            press(&mut board, "y"),
+            [Outcome::Copy {
+                text: "set up the transfer\nbuy milk\nfix bike".into(),
+                what: "3 titles".into()
+            }]
+        );
+        assert_eq!(marks(&board), BTreeSet::from([1, 3, 6]));
+        // Nothing picked, nothing marked: nothing.
+        let mut board = Board::new(vec![], today());
+        assert_eq!(press(&mut board, "y"), [Outcome::Nothing]);
+        // In the remove question, y still answers it.
+        let mut board = sample();
+        let outcomes = press(&mut board, "xy");
+        assert!(matches!(outcomes[1], Outcome::Change(Op::Remove { .. })));
+    }
+
+    #[test]
+    fn the_note_says_only_what_halil_knows_of_the_copy() {
+        let mut board = sample();
+        board.copied("\"pay rent\"", Ok(()));
+        assert_eq!(board.note.as_deref(), Some("Copied \"pay rent\"."));
+        assert_eq!(board.message, None);
+        let mut board = sample();
+        board.copied("3 titles", Ok(()));
+        assert_eq!(board.note.as_deref(), Some("Copied 3 titles."));
+        let mut board = sample();
+        board.sent("\"pay rent\"", Ok(()));
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Sent \"pay rent\" to the terminal's clipboard.")
+        );
+        // A command that failed: in the refusal's colour.
+        let mut board = sample();
+        board.copied("\"pay rent\"", Err("xclip failed (exit status: 1)".into()));
+        assert_eq!(board.note, None);
+        let said = "couldn't copy \"pay rent\": xclip failed (exit status: 1)";
+        assert_eq!(board.message.as_deref(), Some(said));
+        let (lines, _) = board.draw(100, 12);
+        let span = lines[10].iter().find(|s| s.text == said).unwrap();
+        assert_eq!(span.style.fg, Some(RED));
+    }
+
+    #[test]
+    fn ys_text_goes_to_the_copy_command_off_the_keys_path() {
+        // A stand-in for the platform's command, writing into this test's
+        // own scratch folder: the real clipboard is never touched.
+        let dir = env::temp_dir().join(format!("halil-test-{}-board-copy", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut board = marked_sample();
+        let [Outcome::Copy { text, what }] = &press(&mut board, "y")[..] else {
+            panic!("y copies");
+        };
+        let (tx, rx) = mpsc::channel();
+        let args = vec![
+            "-c".into(),
+            "cat > \"$1/clipboard\"".into(),
+            "sh".into(),
+            dir.display().to_string(),
+        ];
+        clip::spawn(
+            "sh".into(),
+            args,
+            text.clone(),
+            what.clone(),
+            clip::LIMIT,
+            tx,
+        );
+        let (what, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        board.copied(&what, result);
+        assert_eq!(board.note.as_deref(), Some("Copied 2 titles."));
+        assert_eq!(
+            fs::read_to_string(dir.join("clipboard")).unwrap(),
+            "pay rent\nfix bike"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Hangul.
+
+    #[test]
+    fn hangul_is_read_as_the_keys_it_sits_on_and_said_once_a_run() {
+        let mut board = sub_sample();
+        press(&mut board, "ㅓ");
+        assert_eq!(picked_id(&board), Some(5), "ㅓ is j");
+        assert_eq!(board.hint.as_deref(), Some("ㅓ read as j."));
+        let long = "ㅓ read as j. A Korean input may hold a letter until the next key.";
+        let (lines, _) = board.draw(80, 14);
+        assert_eq!(text(&lines[12]), format!("  {long}"), "whole at 80");
+        let said = lines[12].iter().find(|s| s.text == long).unwrap();
+        assert_eq!(said.style.fg, None, "in the default foreground");
+        // Where that doesn't fit, the short form.
+        let (lines, _) = board.draw(60, 14);
+        assert_eq!(text(&lines[12]), "  ㅓ read as j. It may run a key late.");
+        press(&mut board, "ㅓ");
+        assert_eq!(board.hint, None, "once a run");
+        assert_eq!(picked_id(&board), Some(6));
+
+        // A syllable is its jamo's keys, in order, each change made before
+        // the next key: 어 is d (6 done) then j.
+        run_keys(&mut board, "어");
+        assert_eq!(status(&board, 6), Status::Done);
+        assert_eq!(picked_id(&board), Some(7));
+        // ㅘ is h then k; ㅗ alone is h, refused on a sub item, and said.
+        let mut board = sample();
+        assert_eq!(
+            press(&mut board, "ㅘ"),
+            [Outcome::Nothing, Outcome::Nothing],
+            "h at the edge, k at the top"
+        );
+        assert!(
+            board
+                .hint
+                .as_deref()
+                .unwrap()
+                .starts_with("ㅘ read as h k.")
+        );
+        // Beside a refusal: what room is left decides the form.
+        let mut board = sub_sample();
+        press(&mut board, "jㅗ");
+        assert_eq!(
+            board.message.as_deref(),
+            Some("a sub item moves with its task")
+        );
+        let (lines, _) = board.draw(110, 14);
+        assert_eq!(
+            text(&lines[12]),
+            "  a sub item moves with its task   ㅗ read as h. A Korean input may hold a letter until the next key."
+        );
+        let (lines, _) = board.draw(80, 14);
+        assert_eq!(
+            text(&lines[12]),
+            "  a sub item moves with its task   ㅗ read as h. It may run a key late."
+        );
+        let mut board = sub_sample();
+        press(&mut board, "jㅗ");
+        assert_eq!(
+            board.message.as_deref(),
+            Some("a sub item moves with its task")
+        );
+        // ㅂ is q.
+        assert_eq!(press(&mut board, "ㅂ"), [Outcome::Quit]);
+    }
+
+    #[test]
+    fn hangul_is_words_where_words_are_typed() {
+        let mut board = sample();
+        press(&mut board, "ㅁ");
+        assert_eq!(typed(&board), Some(""), "ㅁ is a: the input opens");
+        press(&mut board, "장보기 ㅓ");
+        assert_eq!(typed(&board), Some("장보기 ㅓ"));
+        key(&mut board, KeyCode::Esc);
+        // 마 is a then k: what's left after a opened the input is typed.
+        press(&mut board, "마");
+        assert_eq!(typed(&board), Some("ㅏ"));
+        key(&mut board, KeyCode::Esc);
+        press(&mut board, "ㄷ");
+        assert_eq!(typed(&board), Some("pay rent"), "ㄷ is e");
+        press(&mut board, "ㅓ");
+        assert_eq!(typed(&board), Some("pay rentㅓ"));
+    }
+
+    // Removing.
+
+    fn delete(board: &mut Board) -> Outcome {
+        key(board, KeyCode::Delete)
+    }
+
+    #[test]
+    fn x_asks_in_the_footer_and_y_removes_the_card_with_its_sub_items() {
+        let mut board = sub_sample();
+        assert_eq!(press(&mut board, "x"), [Outcome::Nothing]);
+        assert_eq!(
+            footer(&mut board, 80),
+            "  Remove 2 \"pay rent\" and its 3 sub items?   y remove · esc keep"
+        );
+        let [Outcome::Change(op)] = &mut press(&mut board, "y")[..] else {
+            panic!("y removes");
+        };
+        assert_eq!(
+            *op,
+            Op::Remove {
+                asked: refs(&[2]),
+                with: refs(&[7, 5, 6]),
+                marked: false
+            }
+        );
+        board.apply(std::mem::replace(op, Op::Finish { refs: vec![] }));
+        assert_eq!(ids(&board, 0), [1, 8], "its sub items with it");
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Removed 2 and its 3 sub items.")
+        );
+        assert_eq!(picked_id(&board), Some(1), "the pick on its row");
+        assert!(
+            footer(&mut board, 80).contains(" x remove "),
+            "the keys again"
+        );
+
+        // Enter removes too, and Delete asks as x does; the last row's
+        // removal leaves the pick on the row above.
+        let mut board = sample();
+        press(&mut board, "j");
+        assert_eq!(delete(&mut board), Outcome::Nothing);
+        assert!(footer(&mut board, 80).starts_with("  Remove 1 \"buy milk\"?"));
+        assert!(enter(&mut board));
+        assert_eq!(board.note.as_deref(), Some("Removed 1."));
+        assert_eq!(ids(&board, 0), [2]);
+        assert_eq!(picked_id(&board), Some(2), "clamped");
+        // ㅌ is x, ㅛ is y.
+        run_keys(&mut board, "ㅌㅛ");
+        assert!(ids(&board, 0).is_empty());
+        assert_eq!(press(&mut board, "x"), [Outcome::Nothing]);
+        assert_eq!(board.asking, None, "nothing to ask about");
+    }
+
+    #[test]
+    fn any_other_key_keeps_it_and_says_nothing_was_removed() {
+        for keep in [
+            KeyCode::Char('j'),
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Char('x'),
+        ] {
+            let mut board = sub_sample();
+            press(&mut board, "x");
+            assert_eq!(key(&mut board, keep), Outcome::Nothing, "{keep:?}");
+            assert_eq!(board.tasks, sub_sample().tasks, "{keep:?}");
+            assert_eq!(board.note.as_deref(), Some("Nothing was removed."));
+            assert_eq!(picked_id(&board), Some(2), "{keep:?} did nothing else");
+            assert_eq!(board.asking, None);
+        }
+        // Ctrl-Y isn't y.
+        let mut board = sub_sample();
+        press(&mut board, "x");
+        assert_eq!(ctrl(&mut board, 'y'), Outcome::Nothing);
+        assert_eq!(board.note.as_deref(), Some("Nothing was removed."));
+    }
+
+    #[test]
+    fn a_picked_sub_item_goes_alone() {
+        let mut board = sub_sample();
+        press(&mut board, "jjx");
+        assert_eq!(
+            footer(&mut board, 80),
+            "  Remove 6 \"set up the transfer\"?   y remove · esc keep"
+        );
+        run_keys(&mut board, "y");
+        assert_eq!(ids(&board, 0), [2, 5, 7, 1, 8]);
+        assert_eq!(board.note.as_deref(), Some("Removed 6."));
+        assert_eq!(picked_id(&board), Some(7));
+    }
+
+    #[test]
+    fn with_marks_x_removes_all_the_marked_a_sub_item_counted_once() {
+        // Pay rent and its sub item 6 marked, and fix bike.
+        let mut board = sub_sample();
+        press(&mut board, " j ");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, " ");
+        assert_eq!(marks(&board), BTreeSet::from([2, 3, 6]));
+        press(&mut board, "x");
+        assert_eq!(
+            footer(&mut board, 80),
+            "  Remove 3 marked and their 2 sub items?   y remove · esc keep"
+        );
+        run_keys(&mut board, "y");
+        assert!(board.marked.is_empty(), "cleared");
+        assert_eq!(
+            board.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [1, 4, 8]
+        );
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Removed 3 marked and their 2 sub items.")
+        );
+
+        // One marked, no sub items.
+        let mut board = sample();
+        press(&mut board, "j x");
+        assert_eq!(
+            footer(&mut board, 80),
+            "  Remove 1 marked?   y remove · esc keep"
+        );
+        run_keys(&mut board, "y");
+        assert_eq!(board.note.as_deref(), Some("Removed 1 marked."));
+        // Kept: the marks stay.
+        let mut board = marked_sample();
+        press(&mut board, "xk");
+        assert_eq!(marks(&board), BTreeSet::from([2, 3]));
+    }
+
+    #[test]
+    fn a_long_question_cuts_the_title_then_leaves_it_out() {
+        let mut board = long_sample();
+        press(&mut board, "x");
+        assert_eq!(
+            footer(&mut board, 80),
+            "  Remove 1 \"write the quarterly repo…\" and its 1 sub item?   y remove · esc keep"
+        );
+        assert_eq!(
+            footer(&mut board, 60),
+            "  Remove 1 and its 1 sub item?   y remove · esc keep"
+        );
+        assert_eq!(footer(&mut board, 46), "  Remove 1 and its 1 sub item?");
+    }
+
+    // Stamps: a task that took a gone task's id isn't it.
+
+    /// Sub sample with fix bike (3) gone and a new 3 in its id, with a stamp.
+    fn three_taken(board: &Board) -> Vec<Task> {
+        let mut fresh: Vec<Task> = board.tasks.iter().filter(|t| t.id != 3).cloned().collect();
+        fresh.push(Task {
+            stamp: 1_763_500_000_000,
+            ..task(3, "walk the dog", Status::Doing, None, &[])
+        });
+        fresh
+    }
+
+    #[test]
+    fn a_mark_on_a_task_whose_id_was_taken_meanwhile_drops() {
+        let mut board = marked_sample();
+        assert_eq!(marks(&board), BTreeSet::from([2, 3]));
+        let fresh = three_taken(&board);
+        board.replace_tasks(fresh);
+        assert_eq!(marks(&board), BTreeSet::from([2]));
+        run_keys(&mut board, "s");
+        assert_eq!(status(&board, 2), Status::Doing);
+        assert_eq!(by_id(&board, 3).title, "walk the dog");
+        assert_eq!(status(&board, 3), Status::Doing, "untouched");
+    }
+
+    #[test]
+    fn a_change_to_a_task_whose_id_was_taken_meanwhile_is_refused_as_gone() {
+        // Each key's change, and the file changed before it's made.
+        for keys in ["d", "l", "h", "t", "xy"] {
+            let mut board = sample();
+            board.key(KeyEvent::from(KeyCode::Tab));
+            let outcomes = press(&mut board, keys);
+            let Some(Outcome::Change(op)) = outcomes.into_iter().last() else {
+                panic!("{keys} is a change");
+            };
+            let fresh = three_taken(&board);
+            board.replace_tasks(fresh.clone());
+            board.apply(op);
+            assert_eq!(board.message.as_deref(), Some("task 3 is gone"), "{keys}");
+            assert_eq!(board.tasks, fresh, "{keys}: the new 3 untouched");
+        }
+        // With marks: the others are changed.
+        let mut board = marked_sample();
+        let [Outcome::Change(op)] = &mut press(&mut board, "d")[..] else {
+            panic!("d is a change");
+        };
+        let fresh = three_taken(&board);
+        board.replace_tasks(fresh);
+        board.apply(std::mem::replace(op, Op::Finish { refs: vec![] }));
+        assert_eq!(board.message.as_deref(), Some("task 3 is gone"));
+        assert_eq!(
+            (status(&board, 2), status(&board, 3)),
+            (Status::Done, Status::Doing)
+        );
+
+        assert_eq!(gone(&[3, 5, 8]), "tasks 3, 5 and 8 are gone");
+    }
+
+    #[test]
+    fn an_open_e_or_a_whose_task_was_taken_meanwhile_is_refused_or_its_own() {
+        let mut board = sample();
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, "e and oil the chain");
+        let fresh = three_taken(&board);
+        board.replace_tasks(fresh.clone());
+        assert_eq!(key(&mut board, KeyCode::Enter), Outcome::Nothing);
+        assert_eq!(board.message.as_deref(), Some("task 3 is gone"));
+        assert_eq!(board.input, None);
+        assert_eq!(board.tasks, fresh);
+
+        let mut board = sample();
+        board.key(KeyEvent::from(KeyCode::Tab));
+        press(&mut board, "Apump the tyres");
+        let fresh = three_taken(&board);
+        board.replace_tasks(fresh);
+        assert!(enter(&mut board));
+        let added = board.tasks.last().unwrap();
+        assert_eq!(
+            (added.title.as_str(), added.parent),
+            ("pump the tyres", None)
+        );
+        assert_eq!(
+            board.note.as_deref(),
+            Some("3 is gone: added as a task of its own.")
+        );
+    }
+
+    // s and t.
+
+    #[test]
+    fn s_sends_to_doing_and_t_to_todo_the_pick_staying_on_its_row() {
+        let mut board = sample();
+        assert_eq!(
+            press(&mut board, "s"),
+            [Outcome::Change(Op::Send {
+                refs: refs(&[2]),
+                to: Status::Doing
+            })]
+        );
+        run_keys(&mut board, "s");
+        assert_eq!(status(&board, 2), Status::Doing);
+        assert_eq!(
+            (board.col, picked_id(&board)),
+            (0, Some(1)),
+            "as d: the next card"
+        );
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(ids(&board, 1), [2, 3]);
+        run_keys(&mut board, "jt");
+        assert_eq!(status(&board, 3), Status::Todo);
+        assert_eq!(picked_id(&board), Some(2));
+
+        // From Done too.
+        board.key(KeyEvent::from(KeyCode::Tab));
+        run_keys(&mut board, "t");
+        assert_eq!(status(&board, 4), Status::Todo);
+        // Digits are no keys, on any column.
+        for c in 0..3 {
+            let mut board = sample();
+            board.col = c;
+            assert!(picked_id(&board).is_some());
+            let outcomes = press(&mut board, "0123456789");
+            assert!(outcomes.iter().all(|o| *o == Outcome::Nothing), "{c}");
+            assert_eq!(board.tasks, sample().tasks);
+        }
+    }
+
+    #[test]
+    fn s_or_t_on_a_card_already_there_says_so() {
+        let mut board = sample();
+        assert_eq!(press(&mut board, "t"), [Outcome::Nothing]);
+        assert_eq!(board.note.as_deref(), Some("2 is in Todo already."));
+        assert_eq!(board.message, None, "not a refusal");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(press(&mut board, "s"), [Outcome::Nothing]);
+        assert_eq!(board.note.as_deref(), Some("3 is in Doing already."));
+        let (lines, _) = board.draw(100, 12);
+        assert_eq!(text(&lines[10]), "  3 is in Doing already.");
+
+        let mut board = marked_sample();
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        press(&mut board, "j ");
+        assert_eq!(marks(&board), BTreeSet::from([1, 2, 3]));
+        run_keys(&mut board, "t");
+        assert_eq!(status(&board, 3), Status::Todo);
+        assert_eq!(press(&mut board, "t"), [Outcome::Nothing]);
+        assert_eq!(board.note.as_deref(), Some("3 are in Todo already."));
+
+        // Beside a marked sub item's staying, whole at 80: buy milk, orphan
+        // and sub item 6 marked.
+        let mut board = sub_sample();
+        press(&mut board, "jj j  ");
+        assert_eq!(marks(&board), BTreeSet::from([1, 6, 8]));
+        assert_eq!(press(&mut board, "t"), [Outcome::Nothing]);
+        let (lines, _) = board.draw(80, 14);
+        assert_eq!(
+            text(&lines[12]),
+            "  1 sub item stayed: a sub item moves with its task   2 are in Todo already."
+        );
+        // One marked card: by its id, as when it's picked.
+        let mut board = sample();
+        press(&mut board, " ");
+        assert_eq!(marks(&board), BTreeSet::from([2]));
+        press(&mut board, "t");
+        assert_eq!(board.note.as_deref(), Some("2 is in Todo already."));
+    }
+
+    #[test]
+    fn s_and_t_on_a_sub_item_are_refused_and_with_marks_marked_sub_items_stay() {
+        let mut board = sub_sample();
+        press(&mut board, "j");
+        for k in ["s", "t"] {
+            assert_eq!(press(&mut board, k), [Outcome::Nothing]);
+            assert_eq!(
+                board.message.as_deref(),
+                Some("a sub item moves with its task")
+            );
+        }
+
+        // Marked: buy milk and sub item 6 (pay rent unmarked).
+        let mut board = sub_sample();
+        press(&mut board, "jj j ");
+        assert_eq!(marks(&board), BTreeSet::from([1, 6]));
+        run_keys(&mut board, "s");
+        assert_eq!(
+            (status(&board, 1), status(&board, 6), status(&board, 2)),
+            (Status::Doing, Status::Todo, Status::Todo)
+        );
+        assert_eq!(
+            board.message.as_deref(),
+            Some("1 sub item stayed: a sub item moves with its task")
+        );
+        assert_eq!(
+            marks(&board),
+            BTreeSet::from([1, 6]),
+            "marks stay, as for h and l"
+        );
+    }
+
+    #[test]
+    fn out_of_done_a_card_reopens_none_of_its_sub_items() {
+        let mut board = sub_sample();
+        run_keys(&mut board, "d");
+        for id in [2, 5, 6, 7] {
+            assert_eq!(status(&board, id), Status::Done);
+        }
+        board.col = 2;
+        board.row[2] = ids(&board, 2).iter().position(|&id| id == 2).unwrap();
+        run_keys(&mut board, "s");
+        assert_eq!(status(&board, 2), Status::Doing);
+        for id in [5, 6, 7] {
+            assert_eq!(status(&board, id), Status::Done, "{id} stays done");
+        }
+        board.col = 1;
+        board.row[1] = 0;
+        run_keys(&mut board, "t");
+        assert_eq!(status(&board, 2), Status::Todo);
+        assert_eq!(status(&board, 6), Status::Done);
+    }
+
+    // Shots for the design session: `HALIL_SHOTS=<dir> cargo test shots --
+    // --ignored` writes them, plain and with colours as ANSI.
+    #[test]
+    #[ignore = "writes shots to $HALIL_SHOTS"]
+    fn shots() {
+        let Some(dir) = env::var_os("HALIL_SHOTS") else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        fs::create_dir_all(&dir).unwrap();
+        let plain = |lines: &[Line]| -> String {
+            lines
+                .iter()
+                .map(|l| text(l).trim_end().to_string() + "\n")
+                .collect()
+        };
+        let ansi = |lines: &[Line]| -> String {
+            lines
+                .iter()
+                .map(|l| {
+                    let mut s: String = l
+                        .iter()
+                        .map(|span| sgr(span.style, true) + &span.text)
+                        .collect();
+                    s += "\x1b[0m\n";
+                    s
+                })
+                .collect()
+        };
+        // One sheet: each frame titled, then the screen.
+        let mut sheets: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut shoot = |sheet: &str, title: &str, board: &mut Board, w: usize, h: usize| {
+            let (lines, _) = board.draw(w, h);
+            let (p, a) = sheets.entry(sheet.to_string()).or_default();
+            let rule = format!("── {title} ({w}×{h}) ");
+            let rule = format!("{rule}{}\n", "─".repeat(w.saturating_sub(rule.width())));
+            *p += &rule;
+            *p += &plain(&lines);
+            *a += &rule;
+            *a += &ansi(&lines);
+        };
+
+        let mixed = || {
+            let mut tasks = vec![
+                due(
+                    task(
+                        1,
+                        "write the quarterly report for the whole team",
+                        Status::Todo,
+                        Some(Priority::High),
+                        &["work", "q4"],
+                    ),
+                    "2026-11-13",
+                ),
+                task(2, "buy milk", Status::Todo, None, &[]),
+                task(
+                    3,
+                    "분기 보고서 초안 작성하고 팀장님께 검토 요청하기",
+                    Status::Todo,
+                    Some(Priority::Med),
+                    &["회사"],
+                ),
+                task(4, "call mum", Status::Todo, None, &["family"]),
+                due(
+                    task(
+                        5,
+                        "renew the passport before the trip in march",
+                        Status::Todo,
+                        Some(Priority::Low),
+                        &[],
+                    ),
+                    "2026-12-30",
+                ),
+                task(6, "장보기", Status::Todo, None, &[]),
+                task(7, "fix bike", Status::Doing, Some(Priority::Low), &[]),
+                due(
+                    task(
+                        8,
+                        "read the lease and mark what to ask the landlord",
+                        Status::Doing,
+                        None,
+                        &["home"],
+                    ),
+                    "2026-11-16",
+                ),
+                task(
+                    9,
+                    "pay rent for november and keep the receipt",
+                    Status::Done,
+                    Some(Priority::High),
+                    &["home"],
+                ),
+                task(13, "월세 이체", Status::Done, None, &[]),
+            ];
+            tasks.extend([
+                sub(
+                    task(
+                        10,
+                        "pull the numbers from last quarter's sheets",
+                        Status::Done,
+                        None,
+                        &[],
+                    ),
+                    1,
+                ),
+                sub(
+                    due(
+                        task(
+                            11,
+                            "ask design for the charts",
+                            Status::Todo,
+                            None,
+                            &["design"],
+                        ),
+                        "2026-11-12",
+                    ),
+                    1,
+                ),
+                sub(task(12, "표와 그래프 정리하기", Status::Todo, None, &[]), 3),
+            ]);
+            Board::new(tasks, today())
+        };
+        for w in [80, 60] {
+            let sheet = format!("jjj-{w}");
+            let mut board = mixed();
+            for (c, &status) in COLUMNS.iter().enumerate() {
+                let name = status_name(status);
+                let id = picked_id(&board).unwrap();
+                shoot(&sheet, &format!("{name}: {id} picked"), &mut board, w, 18);
+                for n in 1..board.column(c).len() {
+                    press(&mut board, "j");
+                    let id = picked_id(&board).unwrap();
+                    shoot(
+                        &sheet,
+                        &format!("{name}, j ×{n}: {id} picked"),
+                        &mut board,
+                        w,
+                        18,
+                    );
+                }
+                board.key(KeyEvent::from(KeyCode::Tab));
+            }
+        }
+
+        for w in [80, 60] {
+            let sheet = format!("footer-{w}");
+            let mut board = sub_sample();
+            shoot(&sheet, "a card in Todo", &mut board, w, 14);
+            press(&mut board, "j");
+            shoot(&sheet, "a sub item picked", &mut board, w, 14);
+            board.key(KeyEvent::from(KeyCode::Tab));
+            shoot(&sheet, "a card in Doing", &mut board, w, 14);
+            board.key(KeyEvent::from(KeyCode::Tab));
+            shoot(&sheet, "a card in Done", &mut board, w, 14);
+            let mut board = marked_sample();
+            shoot(&sheet, "marked", &mut board, w, 14);
+            let mut board = sub_sample();
+            press(&mut board, "x");
+            shoot(&sheet, "x on a card", &mut board, w, 14);
+            let mut board = sub_sample();
+            press(&mut board, "jjx");
+            shoot(&sheet, "x on a sub item", &mut board, w, 14);
+            let mut board = marked_sample();
+            press(&mut board, "x");
+            shoot(&sheet, "x with marks", &mut board, w, 14);
+
+            // What y ends with: a command that ended well, the sequence
+            // sent, a command that failed.
+            let mut board = sub_sample();
+            board.copied("\"pay rent\"", Ok(()));
+            shoot(&sheet, "y, a command that ended well", &mut board, w, 14);
+            let mut board = marked_sample();
+            board.copied("2 titles", Ok(()));
+            shoot(
+                &sheet,
+                "y with marks, a command that ended well",
+                &mut board,
+                w,
+                14,
+            );
+            let mut board = sub_sample();
+            board.sent("\"pay rent\"", Ok(()));
+            shoot(&sheet, "y, the terminal's sequence sent", &mut board, w, 14);
+            let mut board = sub_sample();
+            board.copied("\"pay rent\"", Err("xclip failed (exit status: 1)".into()));
+            shoot(&sheet, "y, a command that failed", &mut board, w, 14);
+        }
+
+        for w in [80, 60] {
+            let sheet = format!("s-t-x-{w}");
+            let mut board = sub_sample();
+            shoot(&sheet, "before", &mut board, w, 14);
+            run_keys(&mut board, "s");
+            shoot(&sheet, "s on pay rent", &mut board, w, 14);
+            board.key(KeyEvent::from(KeyCode::Tab));
+            run_keys(&mut board, "s");
+            shoot(&sheet, "tab, s on pay rent again", &mut board, w, 14);
+            run_keys(&mut board, "t");
+            shoot(&sheet, "t on pay rent", &mut board, w, 14);
+            board.key(KeyEvent::from(KeyCode::BackTab));
+            run_keys(&mut board, "j");
+            run_keys(&mut board, "s");
+            shoot(&sheet, "j, s on a sub item", &mut board, w, 14);
+            run_keys(&mut board, "x");
+            shoot(&sheet, "x on the sub item", &mut board, w, 14);
+            run_keys(&mut board, "y");
+            shoot(&sheet, "y", &mut board, w, 14);
+            run_keys(&mut board, "x");
+            run_keys(&mut board, "n");
+            shoot(&sheet, "x, n", &mut board, w, 14);
+
+            let mut board = sub_sample();
+            board
+                .tasks
+                .push(task(9, "water plants", Status::Done, None, &[]));
+            press(&mut board, "jj j ");
+            board.key(KeyEvent::from(KeyCode::Tab));
+            board.key(KeyEvent::from(KeyCode::Tab));
+            press(&mut board, "  ");
+            assert_eq!(marks(&board), BTreeSet::from([1, 4, 6, 9]));
+            shoot(
+                &sheet,
+                "marked: set up the transfer, buy milk, call mum, water plants",
+                &mut board,
+                w,
+                14,
+            );
+            run_keys(&mut board, "s");
+            shoot(&sheet, "s with marks", &mut board, w, 14);
+            run_keys(&mut board, "t");
+            shoot(&sheet, "t with marks", &mut board, w, 14);
+            run_keys(&mut board, "t");
+            shoot(&sheet, "t again", &mut board, w, 14);
+            run_keys(&mut board, "x");
+            shoot(&sheet, "x with marks", &mut board, w, 14);
+            run_keys(&mut board, "y");
+            shoot(&sheet, "y", &mut board, w, 14);
+        }
+
+        let mut board = sub_sample();
+        press(&mut board, "ㅓ");
+        shoot(
+            "hangul-80",
+            "ㅓ pressed: read as j, said once",
+            &mut board,
+            80,
+            14,
+        );
+        press(&mut board, "ㅓ");
+        shoot("hangul-80", "ㅓ again: not said", &mut board, 80, 14);
+        press(&mut board, "ㅁ");
+        press(&mut board, "장보기");
+        shoot("hangul-80", "ㅁ (a), then 장보기 typed", &mut board, 80, 14);
+
+        for (name, (p, a)) in sheets {
+            fs::write(dir.join(format!("{name}.txt")), p).unwrap();
+            fs::write(dir.join(format!("{name}.ansi")), a).unwrap();
+        }
     }
 }

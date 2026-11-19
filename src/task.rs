@@ -22,6 +22,16 @@ pub struct Task {
     /// The task this is a sub item of (see [`parents`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<u32>,
+    /// Which task this is, for good: set when it's made and never changed, so
+    /// a task that takes a removed task's id is never taken for it (see
+    /// [`new_stamp`]). 0 is none yet: a line written before 0.3.0, until
+    /// [`stamp_unstamped`] gives it one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stamp: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +105,40 @@ pub fn next_id(tasks: &[Task]) -> u32 {
         .expect("fewer than u32::MAX tasks")
 }
 
+/// The stamp a new task gets: the time, in milliseconds since 1970, or one
+/// past the largest stamp in `tasks` if that's later. No two tasks in a file
+/// share one: every change is made to the file as it was read, so each file is
+/// one halil's tasks, and each new stamp is past all of theirs. Milliseconds,
+/// not finer, so the number stays exact in JSON readers that hold numbers as
+/// doubles.
+pub fn new_stamp(tasks: &[Task], now_ms: u64) -> u64 {
+    let past = tasks.iter().map(|t| t.stamp).max().unwrap_or(0);
+    now_ms.max(past.saturating_add(1))
+}
+
+/// Milliseconds since 1970 by the system clock.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Gives a stamp to each task read from a line that had none (written before
+/// 0.3.0, or since by 0.2.0, which drops it): one made from its id and title,
+/// so every read of the line, until a save writes it, gives the same stamp. It
+/// stays below 2³², under any time [`new_stamp`] gives, and a task that took
+/// the id since has another title and so, all but surely, another stamp.
+pub fn stamp_unstamped(tasks: &mut [Task]) {
+    for task in tasks.iter_mut().filter(|t| t.stamp == 0) {
+        // FNV-1a: small, and the same in every build.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in task.id.to_le_bytes().iter().chain(task.title.as_bytes()) {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        task.stamp = (hash & 0xffff_ffff).max(1);
+    }
+}
+
 /// Whether `task` is under another task that's there: such a task takes no
 /// sub items of its own, since they go one level deep.
 pub fn is_sub_item(tasks: &[Task], task: &Task) -> bool {
@@ -165,8 +209,40 @@ mod tests {
                 tags: vec![],
                 due: None,
                 parent: None,
+                stamp: 0,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_new_stamp_is_the_time_or_past_every_stamp_there() {
+        let mut tasks = with_ids(&[1, 2]);
+        assert_eq!(new_stamp(&tasks, 1_000), 1_000);
+        tasks[0].stamp = 1_000;
+        assert_eq!(new_stamp(&tasks, 1_000), 1_001, "made in the same ms");
+        tasks[1].stamp = 5_000;
+        assert_eq!(new_stamp(&tasks, 1_000), 5_001, "the clock went back");
+        assert_eq!(new_stamp(&tasks, 9_000), 9_000);
+    }
+
+    #[test]
+    fn an_unstamped_line_gets_the_same_stamp_on_every_read_and_a_new_title_another() {
+        let mut tasks = with_ids(&[3, 4]);
+        tasks[1].stamp = 1_763_500_000_000;
+        stamp_unstamped(&mut tasks);
+        let three = tasks[0].stamp;
+        assert!(three > 0 && three < 1 << 32, "{three}");
+        assert_eq!(tasks[1].stamp, 1_763_500_000_000, "a stamp stays");
+
+        let mut again = with_ids(&[3]);
+        stamp_unstamped(&mut again);
+        assert_eq!(again[0].stamp, three, "the same line, the same stamp");
+
+        // 3 removed, and a new 3 written by 0.2.0, without a stamp.
+        let mut other = with_ids(&[3]);
+        other[0].title = "pay rent".into();
+        stamp_unstamped(&mut other);
+        assert_ne!(other[0].stamp, three);
     }
 
     #[test]

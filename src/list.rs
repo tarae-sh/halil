@@ -153,6 +153,7 @@ mod tests {
             tags: vec![],
             due: None,
             parent: None,
+            stamp: 0,
         }
     }
 
