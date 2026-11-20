@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
@@ -23,11 +24,13 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use jiff::Zoned;
-use jiff::civil::Date;
+use jiff::civil::{Date, DateTime};
+use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::clip::{self, Clipboard};
+use crate::date::{self, Due};
 use crate::hangul;
 use crate::parse::{self, Change, Parsed};
 use crate::store;
@@ -57,6 +60,8 @@ pub fn run(path: &Path, tasks: Vec<Task>) -> Result<(), String> {
     }
     let color = env::var_os("NO_COLOR").is_none();
     let mut board = Board::new(tasks, Zoned::now().date());
+    board.folded = load_folds(&folds_path(path));
+    board.keep_folds_in_sight();
     let mut out = io::stdout();
     let _screen = Screen::enter(&mut out).map_err(term_err)?;
     event_loop(&mut board, path, &mut out, color, clip::detect())
@@ -183,7 +188,46 @@ fn event_loop(
                 None => break,
             }
         }
+        board.keep_folds(path);
     }
+}
+
+/// Where the board keeps which cards are folded: a file of its own beside
+/// the tasks file, which `halil` itself never reads.
+pub fn folds_path(tasks: &Path) -> PathBuf {
+    tasks.with_file_name("board.json")
+}
+
+/// The board's own file: the folded cards, by id and stamp.
+#[derive(Default, Serialize, Deserialize)]
+struct Kept {
+    #[serde(default)]
+    folded: Vec<Ref>,
+}
+
+/// The folded cards kept at `path`: none when it's missing or can't be read,
+/// never an error.
+fn load_folds(path: &Path) -> BTreeSet<Ref> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Kept>(&text).ok())
+        .map(|kept| kept.folded.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Keeps the folded cards at `path`, written beside it, then renamed over it.
+fn save_folds(path: &Path, folded: &BTreeSet<Ref>) -> Result<(), String> {
+    let kept = Kept {
+        folded: folded.iter().copied().collect(),
+    };
+    let fail = |e: io::Error| format!("can't keep the folds in {}: {e}", path.display());
+    let text = serde_json::to_string(&kept).map_err(|e| e.to_string())? + "\n";
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(fail)?;
+    }
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&tmp, text).map_err(fail)?;
+    fs::rename(&tmp, path).map_err(fail)
 }
 
 /// What a key asks of the loop.
@@ -210,7 +254,7 @@ const HANGUL_LATE: [&str; 2] = [
 
 /// A task as the board holds it while it waits on a key: its id, and its
 /// stamp, so a task that took the id meanwhile is never taken for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Ref {
     pub id: u32,
     pub stamp: u64,
@@ -296,10 +340,12 @@ fn gone(ids: &[u32]) -> String {
 
 pub struct Board {
     pub tasks: Vec<Task>,
-    /// The column picked, and the card picked in each column.
+    /// The column picked, and the row picked in it. Another column holds no
+    /// pick of its own: going there lands on the row on the same line (see
+    /// [`Board::pick_column`]).
     col: usize,
-    row: [usize; 3],
-    /// The first card shown in each column, when it has more than fit.
+    row: usize,
+    /// The first row drawn in each column, when it has more than fit.
     scroll: [usize; 3],
     /// The cards and sub items marked with space, which h, l, s, t, d, e and
     /// x act on together: each id, with its stamp.
@@ -323,6 +369,13 @@ pub struct Board {
     hint: Option<String>,
     /// The day due dates are read from.
     today: Date,
+    /// The cards whose sub items are folded away, and whether that changed
+    /// since it was last kept (see [`Board::keep_folds`]).
+    folded: BTreeSet<Ref>,
+    folds_changed: bool,
+    /// Whether the screen last drawn had room for the calendar: without it,
+    /// the arrows and esc are the input's.
+    cal_room: bool,
 }
 
 impl Board {
@@ -331,7 +384,7 @@ impl Board {
             tasks,
             today,
             col: 0,
-            row: [0; 3],
+            row: 0,
             scroll: [0; 3],
             marked: BTreeMap::new(),
             input: None,
@@ -341,6 +394,48 @@ impl Board {
             message: None,
             note: None,
             hint: None,
+            folded: BTreeSet::new(),
+            folds_changed: false,
+            cal_room: true,
+        }
+    }
+
+    /// Whether the card at `tasks[i]` is folded.
+    fn is_folded(&self, i: usize) -> bool {
+        self.folded.contains(&self.held(i))
+    }
+
+    /// Forgets the folds of cards that are gone.
+    fn keep_folds_in_sight(&mut self) {
+        let there: BTreeSet<Ref> = (0..self.tasks.len()).map(|i| self.held(i)).collect();
+        self.folded.retain(|r| there.contains(r));
+    }
+
+    /// Keeps the folds in their file beside the tasks file at `path`, when
+    /// they changed.
+    pub fn keep_folds(&mut self, path: &Path) {
+        if std::mem::take(&mut self.folds_changed)
+            && let Err(e) = save_folds(&folds_path(path), &self.folded)
+        {
+            self.message = Some(e);
+        }
+    }
+
+    /// A card's due date as the board shows it: its own, or, folded outside
+    /// Done, a hidden open sub item's when that's sooner or the card has none.
+    fn card_due(&self, i: usize, parents: &[Option<usize>]) -> Option<Due> {
+        let own = self.tasks[i].due;
+        if !self.is_folded(i) || self.tasks[i].status == Status::Done {
+            return own;
+        }
+        let hidden = task::sub_items(&self.tasks, parents, i)
+            .into_iter()
+            .filter(|&s| self.tasks[s].status != Status::Done)
+            .filter_map(|s| self.tasks[s].due)
+            .min();
+        match (own, hidden) {
+            (Some(own), Some(hidden)) => Some(own.min(hidden)),
+            (own, hidden) => own.or(hidden),
         }
     }
 
@@ -384,7 +479,8 @@ impl Board {
 
     /// The rows of column `c`, as indices into `tasks`: its cards, each with
     /// its sub items under it in id order, whatever their own status — but in
-    /// Done, where they're folded into their card's count.
+    /// Done, where they're folded into their card's count, and under a card
+    /// folded with `z`.
     fn column(&self, c: usize) -> Vec<usize> {
         let parents = task::parents(&self.tasks);
         let cards = self.cards(c, &parents);
@@ -393,7 +489,13 @@ impl Board {
         }
         cards
             .into_iter()
-            .flat_map(|i| std::iter::once(i).chain(task::sub_items(&self.tasks, &parents, i)))
+            .flat_map(|i| {
+                let subs = match self.is_folded(i) {
+                    true => Vec::new(),
+                    false => task::sub_items(&self.tasks, &parents, i),
+                };
+                std::iter::once(i).chain(subs)
+            })
             .collect()
     }
 
@@ -408,9 +510,10 @@ impl Board {
         } else {
             // As the list does: soonest due first (so late ones lead), undated
             // after, then highest priority, then oldest.
+            // A folded card by the date it shows (see `card_due`).
             ids.sort_by_key(|&i| {
-                let t = &self.tasks[i];
-                (t.due.is_none(), t.due, Reverse(t.priority), t.id)
+                let (t, due) = (&self.tasks[i], self.card_due(i, parents));
+                (due.is_none(), due, Reverse(t.priority), t.id)
             });
         }
         ids
@@ -418,7 +521,7 @@ impl Board {
 
     /// The picked card or sub item, as an index into `tasks`.
     fn picked(&self) -> Option<usize> {
-        self.column(self.col).get(self.row[self.col]).copied()
+        self.column(self.col).get(self.row).copied()
     }
 
     fn index(&self, id: u32) -> Option<usize> {
@@ -438,7 +541,7 @@ impl Board {
             .unwrap_or(0);
         self.col = c;
         let rows = self.column(c);
-        self.row[c] = rows
+        self.row = rows
             .iter()
             .position(|&j| j == i)
             .or_else(|| rows.iter().position(|&j| j == card))
@@ -457,11 +560,22 @@ impl Board {
         self.picked().map(|i| self.held(i))
     }
 
-    /// Keeps every column's pick on a card.
+    /// Keeps the pick on a row of its column.
     fn clamp(&mut self) {
-        for c in 0..COLUMNS.len() {
-            self.row[c] = self.row[c].min(self.column(c).len().saturating_sub(1));
+        self.row = self.row.min(self.column(self.col).len().saturating_sub(1));
+    }
+
+    /// Takes the pick to column `c` (tab, the arrows): to the row drawn on
+    /// the same line as the picked row's first, or the column's last row when
+    /// none is on that line.
+    fn pick_column(&mut self, c: usize) {
+        if c == self.col {
+            return;
         }
+        let line = self.row.saturating_sub(self.scroll[self.col]);
+        let rows = self.column(c).len();
+        self.col = c;
+        self.row = (self.scroll[c] + line).min(rows.saturating_sub(1));
     }
 
     /// Takes the tasks as they are on disk now, keeping the picked card picked
@@ -469,6 +583,7 @@ impl Board {
     pub fn replace_tasks(&mut self, tasks: Vec<Task>) {
         let picked = self.picked_ref();
         self.tasks = tasks;
+        self.keep_folds_in_sight();
         self.keep_marks_in_sight();
         if let Some(at) = picked {
             self.repick(at, self.col);
@@ -477,13 +592,16 @@ impl Board {
     }
 
     /// Drops the marks on tasks that are gone (a task that took one's id
-    /// meanwhile has another stamp), and on sub items whose card is done:
-    /// folded into its count, out of sight, they're no rows for a key to act
-    /// on.
+    /// meanwhile has another stamp), and on sub items whose card is done or
+    /// folded: folded into its count, out of sight, they're no rows for a key
+    /// to act on.
     fn keep_marks_in_sight(&mut self) {
         let parents = task::parents(&self.tasks);
         let in_sight: BTreeSet<Ref> = (0..self.tasks.len())
-            .filter(|&i| parents[i].is_none_or(|p| self.tasks[p].status != Status::Done))
+            .filter(|&i| {
+                parents[i]
+                    .is_none_or(|p| self.tasks[p].status != Status::Done && !self.is_folded(p))
+            })
             .map(|i| self.held(i))
             .collect();
         self.marked
@@ -623,8 +741,67 @@ impl Board {
             }
         }
         // A card gone to Done (d, l, a marked l) folds its sub items away.
+        self.keep_folds_in_sight();
         self.keep_marks_in_sight();
         self.clamp();
+    }
+
+    /// `z`: folds the picked card's sub items away, or unfolds them; on a sub
+    /// item, its card's, the pick going to the card. Folding clears their
+    /// marks, and says how many.
+    fn fold(&mut self) {
+        let Some(i) = self.picked() else {
+            return;
+        };
+        let parents = task::parents(&self.tasks);
+        let card = parents[i].unwrap_or(i);
+        let id = self.tasks[card].id;
+        if COLUMNS[self.col] == Status::Done {
+            self.message = Some("in Done, sub items are folded into the count".into());
+            return;
+        }
+        if task::sub_items(&self.tasks, &parents, card).is_empty() {
+            self.message = Some(format!("{id} has no sub items to fold"));
+            return;
+        }
+        let at = self.held(card);
+        let place = |board: &Board| {
+            let parents = task::parents(&board.tasks);
+            board
+                .cards(board.col, &parents)
+                .iter()
+                .position(|&c| c == card)
+        };
+        let was = place(self);
+        let mut said = Vec::new();
+        let folding = !self.folded.remove(&at);
+        if folding {
+            self.folded.insert(at);
+            let marked = self.marked.len();
+            self.keep_marks_in_sight();
+            match marked - self.marked.len() {
+                0 => {}
+                1 => said.push("Cleared the mark on its sub item.".to_string()),
+                n => said.push(format!("Cleared the marks on its {n} sub items.")),
+            }
+        }
+        // A folded card sorts by the date it shows: when that moved it, why.
+        if place(self) != was {
+            said.push(match folding {
+                true => {
+                    let shown = Task {
+                        due: self.card_due(card, &parents),
+                        ..self.tasks[card].clone()
+                    };
+                    let days = due_in_days(&shown, self.today).unwrap_or_default();
+                    format!("Sorted by its sub item's date now: {}.", due_in_words(days))
+                }
+                false => "Sorted by its own date again.".into(),
+            });
+        }
+        self.note = (!said.is_empty()).then(|| said.join(" "));
+        self.folds_changed = true;
+        self.pick(id);
     }
 
     /// The open tasks `Op::Finish` of `ids` marks done, as indices into
@@ -688,6 +865,7 @@ impl Board {
             // whose first key opened the input goes in as it was typed.
             if let Some(jamo) = jamo {
                 input.text.insert(input.cursor, jamo);
+                input.edited(input.cursor..input.cursor, jamo.len_utf8());
                 input.cursor += jamo.len_utf8();
                 return Outcome::Nothing;
             }
@@ -732,21 +910,17 @@ impl Board {
                     if self.marked.remove(&id) != Some(stamp) {
                         self.marked.insert(id, stamp);
                     }
-                    self.row[self.col] = (self.row[self.col] + 1).min(last);
+                    self.row = (self.row + 1).min(last);
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.row[self.col] = (self.row[self.col] + 1).min(last)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.row[self.col] = self.row[self.col].saturating_sub(1)
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.row[self.col] = 0,
-            KeyCode::Char('G') | KeyCode::End => self.row[self.col] = last,
-            KeyCode::Right => self.col = (self.col + 1).min(COLUMNS.len() - 1),
-            KeyCode::Left => self.col = self.col.saturating_sub(1),
-            KeyCode::Tab => self.col = (self.col + 1) % COLUMNS.len(),
-            KeyCode::BackTab => self.col = (self.col + COLUMNS.len() - 1) % COLUMNS.len(),
+            KeyCode::Char('j') | KeyCode::Down => self.row = (self.row + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.row = self.row.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.row = 0,
+            KeyCode::Char('G') | KeyCode::End => self.row = last,
+            KeyCode::Right => self.pick_column((self.col + 1).min(COLUMNS.len() - 1)),
+            KeyCode::Left => self.pick_column(self.col.saturating_sub(1)),
+            KeyCode::Tab => self.pick_column((self.col + 1) % COLUMNS.len()),
+            KeyCode::BackTab => self.pick_column((self.col + COLUMNS.len() - 1) % COLUMNS.len()),
             KeyCode::Char('h') => return self.shift(-1),
             KeyCode::Char('l') => return self.shift(1),
             KeyCode::Char('s') => return self.send(Status::Doing),
@@ -754,6 +928,7 @@ impl Board {
             KeyCode::Char('d') => return self.finish(),
             KeyCode::Char('x') | KeyCode::Delete => self.ask_removal(),
             KeyCode::Char('y') => return self.copy(),
+            KeyCode::Char('z') => self.fold(),
             KeyCode::Char('a') => self.input = Some(Input::new(InputKind::Add, String::new())),
             KeyCode::Char('A') => {
                 if let Some(i) = self.picked() {
@@ -762,6 +937,10 @@ impl Board {
                         let id = self.tasks[card].id;
                         self.message = Some(format!("{id} is a sub item: they go one level deep"));
                     } else {
+                        // Folded, it opens: the new one shows when it's added.
+                        if self.folded.remove(&self.held(card)) {
+                            self.folds_changed = true;
+                        }
                         let kind = InputKind::Sub(self.held(card));
                         self.input = Some(Input::new(kind, String::new()));
                     }
@@ -1004,11 +1183,52 @@ impl Board {
         }
     }
 
+    /// The time dates are read as of: now, or the start of the board's day
+    /// when that isn't today (a test's day).
+    fn now(&self) -> DateTime {
+        let now = Zoned::now().datetime();
+        match now.date() == self.today {
+            true => now,
+            false => self.today.to_datetime(jiff::civil::Time::midnight()),
+        }
+    }
+
+    /// The date of the task an `e` is typing for, if it has one.
+    fn editing_due(&self) -> Option<Due> {
+        match self.input.as_ref()?.kind {
+            InputKind::Edit(at) => self.find(at).and_then(|i| self.tasks[i].due),
+            _ => None,
+        }
+    }
+
     fn input_key(&mut self, key: KeyEvent) -> Outcome {
+        let (now, today, own) = (self.now(), self.today, self.editing_due());
+        let cal_room = self.cal_room;
         let Some(input) = self.input.as_mut() else {
             return Outcome::Nothing;
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // While the calendar is up, the arrows and the page keys are its, and
+        // esc closes it, the words left as they are.
+        if input.cal.is_some() && cal_room && !ctrl {
+            let by = match key.code {
+                KeyCode::Left => Some(jiff::Span::new().days(-1)),
+                KeyCode::Right => Some(jiff::Span::new().days(1)),
+                KeyCode::Up => Some(jiff::Span::new().weeks(-1)),
+                KeyCode::Down => Some(jiff::Span::new().weeks(1)),
+                KeyCode::PageUp => Some(jiff::Span::new().months(-1)),
+                KeyCode::PageDown => Some(jiff::Span::new().months(1)),
+                _ => None,
+            };
+            if let Some(by) = by {
+                input.move_day(by, own, now, today);
+                return Outcome::Nothing;
+            }
+            if key.code == KeyCode::Esc {
+                input.cal = None;
+                return Outcome::Nothing;
+            }
+        }
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Char('c') if ctrl => self.input = None,
@@ -1016,26 +1236,37 @@ impl Board {
             KeyCode::Char('e') if ctrl => input.cursor = input.text.len(),
             KeyCode::Char('u') if ctrl => {
                 input.text.replace_range(..input.cursor, "");
+                input.edited(0..input.cursor, 0);
                 input.cursor = 0;
             }
             KeyCode::Char('w') if ctrl => {
                 let before = input.text[..input.cursor].trim_end();
                 let kept = before.rfind(' ').map_or(0, |i| i + 1);
                 input.text.replace_range(kept..input.cursor, "");
+                input.edited(kept..input.cursor, 0);
                 input.cursor = kept;
             }
             KeyCode::Char(c) if !ctrl => {
                 input.text.insert(input.cursor, c);
+                input.edited(input.cursor..input.cursor, c.len_utf8());
                 input.cursor += c.len_utf8();
+                // The second `/` of a `//` opens the calendar under it.
+                if c == '/' && input.text[..input.cursor].ends_with("//") {
+                    input.cal = Some(Cal {
+                        at: input.cursor - 2,
+                    });
+                }
             }
             KeyCode::Backspace => {
                 let prev = input.prev();
                 input.text.replace_range(prev..input.cursor, "");
+                input.edited(prev..input.cursor, 0);
                 input.cursor = prev;
             }
             KeyCode::Left => input.cursor = input.prev(),
             KeyCode::Right => input.cursor = input.next(),
             KeyCode::Enter => {
+                input.cal = None;
                 let (kind, words) = (input.kind, [input.text.clone()]);
                 return self.submit(kind, &words);
             }
@@ -1047,7 +1278,7 @@ impl Board {
     /// Enter on the input: the change its words ask for, or why they can't be
     /// read, the words kept.
     fn submit(&mut self, kind: InputKind, words: &[String; 1]) -> Outcome {
-        let now = Zoned::now().datetime();
+        let now = self.now();
         if let InputKind::Add | InputKind::Sub(_) = kind {
             if words[0].trim().is_empty() {
                 self.input = None;
@@ -1159,45 +1390,74 @@ impl Board {
         let parents = task::parents(&self.tasks);
         let x = |c: usize| MARGIN + c * (col_w + GAP);
         let edge = x(COLUMNS.len() - 1) + col_w;
-        // Each column's rows, drawn: the picked one, shown whole, may run
-        // over the columns to its right, or take more than a line, and the
-        // column scrolls to show it; the rest are one line each.
+        // Each column's rows, drawn, one line each. The picked one, shown
+        // whole, may run over the columns to its right, or take more than a
+        // line: it's drawn over the rest (`over`: its column, its line in the
+        // body, its rows), and the column scrolls to show it all.
         let mut cells: Vec<Vec<Row>> = Vec::new();
+        let mut over: Option<(usize, usize, Vec<Row>)> = None;
         for (c, rows) in columns.iter().enumerate() {
             let drawn = |n: usize| {
                 let i = rows[n];
                 let look = Look {
                     width: col_w,
                     room: edge - x(c),
-                    picked: c == self.col && n == self.row[c],
+                    picked: c == self.col && n == self.row,
                     marked: self.is_marked(i),
                     today: self.today,
+                    late_count: false,
                 };
                 if parents[i].is_some() {
                     sub_item(&self.tasks[i], look)
                 } else {
                     let subs = task::sub_items(&self.tasks, &parents, i);
                     let count = task::progress(&self.tasks, &subs);
-                    card(&self.tasks[i], count.as_deref(), look)
+                    if COLUMNS[c] == Status::Done || !self.is_folded(i) {
+                        return card(&self.tasks[i], count.as_deref(), look);
+                    }
+                    // Folded, it never hides what's due: a late open sub
+                    // item reddens the count, and the soonest gives the card
+                    // its date when that's sooner.
+                    let late = subs
+                        .iter()
+                        .any(|&s| due_in_days(&self.tasks[s], self.today).is_some_and(|d| d < 0));
+                    let shown = Task {
+                        due: self.card_due(i, &parents),
+                        ..self.tasks[i].clone()
+                    };
+                    let count = count.map(|n| format!("▸ {n}"));
+                    let look = Look {
+                        late_count: late,
+                        ..look
+                    };
+                    card(&shown, count.as_deref(), look)
                 }
             };
-            let pick = self.row[c];
-            let tall = if pick < rows.len() {
-                drawn(pick).len()
+            // The picked column scrolls to keep the pick in view; another
+            // stays where it was, as far as its rows go.
+            let s = if c == self.col {
+                let pick = self.row;
+                let tall = if pick < rows.len() {
+                    drawn(pick).len()
+                } else {
+                    1
+                };
+                let mut s = self.scroll[c].min(pick);
+                s = s.max((pick + tall).saturating_sub(body_h)).min(pick);
+                s.min((rows.len() + tall - 1).saturating_sub(body_h))
             } else {
-                1
+                self.scroll[c].min(rows.len().saturating_sub(body_h))
             };
-            let mut s = self.scroll[c].min(pick);
-            s = s.max((pick + tall).saturating_sub(body_h)).min(pick);
-            s = s.min((rows.len() + tall - 1).saturating_sub(body_h));
             let mut lines = Vec::new();
-            for n in s..rows.len() {
-                if lines.len() >= body_h {
-                    break;
+            for n in s..rows.len().min(s + body_h) {
+                let mut row = drawn(n);
+                if row.len() > 1 || row[0].width > col_w {
+                    over = Some((c, n - s, row));
+                    lines.push(Row::default());
+                } else {
+                    lines.push(row.remove(0));
                 }
-                lines.extend(drawn(n));
             }
-            lines.truncate(body_h);
             self.scroll[c] = s;
             cells.push(lines);
         }
@@ -1234,15 +1494,19 @@ impl Board {
                         },
                     );
                 }
-                // A neighbour's row is whole or not there: where a picked row
-                // shown whole reaches into this column, its row on this line
-                // isn't drawn, never cut to what's past the ground.
-                if row.width <= x(c) {
-                    row.pad_to(x(c), Style::default());
-                    row.append(&cell);
-                }
+                row.pad_to(x(c), Style::default());
+                row.append(&cell);
             }
             lines.push(row.spans);
+        }
+        // The picked row whole, over its neighbours: they're cut where it
+        // ends, a double-width letter there covered whole.
+        if let Some((c, at, rows)) = over {
+            for (j, top) in rows.iter().enumerate() {
+                if let Some(line) = lines.get_mut(3 + at + j).filter(|_| at + j < body_h) {
+                    *line = overlay(line, x(c), top, styles(true).0);
+                }
+            }
         }
 
         // A refusal in red, then a note of what was done in the terminal's
@@ -1279,28 +1543,30 @@ impl Board {
 
         let mut footer = Row::default();
         let mut cursor = None;
+        // The calendar's `//`, where it's drawn in the footer.
+        let mut cal_x = None;
         match &self.input {
             Some(input) => {
                 let (label, hint, example) = match input.kind {
                     InputKind::Add => (
                         "New task".to_string(),
                         "enter to add · esc to cancel",
-                        "title friday +tag !high",
+                        "title //fri 6pm +tag !high",
                     ),
                     InputKind::Sub(at) => (
                         format!("Sub item of {}", at.id),
                         "enter to add · esc to cancel",
-                        "title friday +tag !high",
+                        "title //fri 6pm +tag !high",
                     ),
                     InputKind::Edit(at) => (
                         format!("Edit {}", at.id),
                         "enter to change · esc to cancel",
-                        "title friday +tag -tag !high",
+                        "title //fri 6pm +tag -tag !high",
                     ),
                     InputKind::EditMarked => (
                         format!("Edit {} marked", self.marked.len()),
                         "enter to change · esc to cancel",
-                        "friday +tag -tag !high",
+                        "//fri 6pm +tag -tag !high",
                     ),
                 };
                 footer.push(&format!("  {label}  "), Style::fg(QUIET));
@@ -1310,9 +1576,13 @@ impl Board {
                 if input.text.is_empty() {
                     footer.push(&truncate(example, room), Style::fg(QUIETER));
                 } else {
-                    let (shown, x) = view(&input.text, input.cursor, room);
+                    let (shown, x, from) = view(&input.text, input.cursor, room);
                     footer.push(&shown, Style::default());
                     at = x;
+                    cal_x = input.cal.map(|cal| match cal.at.checked_sub(from) {
+                        Some(_) => start + input.text[from..cal.at].width(),
+                        None => start,
+                    });
                 }
                 cursor = Some(((start + at) as u16, (h - 1) as u16));
                 if room > 0 {
@@ -1380,18 +1650,32 @@ impl Board {
                 // the rest. `d` goes last, and its word for what it does to
                 // the picked row with it.
                 let sub = self.picked().is_some_and(|i| parents[i].is_some());
+                // `z` where it acts: on a card with sub items, or one of
+                // them, outside Done.
+                let folds = self
+                    .picked()
+                    .map(|i| parents[i].unwrap_or(i))
+                    .filter(|&card| {
+                        COLUMNS[self.col] != Status::Done
+                            && !task::sub_items(&self.tasks, &parents, card).is_empty()
+                    });
+                let fold = match folds.map(|card| self.is_folded(card)) {
+                    Some(true) => "unfold",
+                    _ => "fold",
+                };
                 footer.push(" ", Style::default());
                 let mut hints = vec![
                     ("j k", "pick", Some(4)),
-                    ("space", "mark", Some(9)),
-                    ("h l", "move", Some(12)),
+                    ("space", "mark", Some(10)),
+                    ("h l", "move", Some(13)),
                     ("t", "todo", Some(5)),
                     ("s", "doing", Some(7)),
                     ("d", if sub { "done/open" } else { "done" }, None),
                     ("tab", "column", Some(1)),
-                    ("a", "add", Some(11)),
-                    ("A", "sub", Some(8)),
-                    ("e", "edit", Some(10)),
+                    ("a", "add", Some(12)),
+                    ("A", "sub", Some(9)),
+                    ("e", "edit", Some(11)),
+                    ("z", fold, Some(8)),
                     ("y", "copy", Some(2)),
                     ("x", "remove", Some(6)),
                     ("q", "quit", Some(3)),
@@ -1405,6 +1689,7 @@ impl Board {
                     "t" => COLUMNS[self.col] != Status::Todo,
                     "s" => COLUMNS[self.col] != Status::Doing,
                     "d" => COLUMNS[self.col] != Status::Done,
+                    "z" => folds.is_some(),
                     _ => true,
                 });
                 for (keys, what) in giving_way(&hints, w.saturating_sub(footer.width), 3) {
@@ -1414,8 +1699,133 @@ impl Board {
             }
         }
         lines.push(footer.spans);
+
+        // The calendar, above the typing line, its left edge at the `//`,
+        // inside the screen; without room, the row above says so.
+        self.cal_room = h > CAL_ROWS && w >= CAL_GRID + 2;
+        if let (Some(x), Some(input)) = (cal_x, &self.input)
+            && let Some(cal) = input.cal
+        {
+            if self.cal_room {
+                let day = parse::marked_due(&input.text, cal.at, self.now())
+                    .or(self.editing_due())
+                    .map(|d| d.date);
+                let due: BTreeSet<Date> = self
+                    .tasks
+                    .iter()
+                    .filter(|t| t.status != Status::Done)
+                    .filter_map(|t| t.due.map(|d| d.date))
+                    .collect();
+                let width = w.min(CAL_KEYS_W + 4);
+                let card = calendar(day, self.today, &due, width);
+                let (left, top) = (x.min(w - width), h - 1 - CAL_ROWS);
+                for (j, row) in card.iter().enumerate() {
+                    lines[top + j] = overlay(&lines[top + j], left, row, Style::default());
+                }
+            } else if message.width == 0 {
+                let mut said = Row::default();
+                said.push("  ", Style::default());
+                said.push(
+                    &truncate(NO_ROOM_FOR_CAL, w.saturating_sub(2)),
+                    Style::default(),
+                );
+                lines[h - 2] = said.spans;
+            }
+        }
         (lines, cursor)
     }
+}
+
+/// The width of the calendar's keys, all of them, with two cells between.
+const CAL_KEYS_W: usize = 43;
+
+/// The calendar's card, `width` wide (22 at least), as its rows: the month of
+/// `day` (or of `today`) in its top line, the weekdays faint, Sunday first,
+/// then six weeks, `day` in the picked row's colours, `today` in the accent,
+/// a day with something `due` in bold; its keys on the bottom line, whole
+/// pairs, those that don't fit giving way from the right.
+fn calendar(day: Option<Date>, today: Date, due: &BTreeSet<Date>, width: usize) -> Vec<Row> {
+    let frame = Style::fg(QUIET);
+    let pad = (width - 2 - CAL_GRID) / 2;
+    let first = day.unwrap_or(today).first_of_month();
+    let mut rows = Vec::new();
+
+    let mut top = Row::default();
+    top.push("╭ ", frame);
+    top.push(&first.strftime("%B %Y").to_string(), Style::default());
+    top.push(" ", frame);
+    top.push(&"─".repeat(width - 1 - top.width), frame);
+    top.push("╮", frame);
+    rows.push(top);
+
+    let side = |row: &mut Row, inside: Row| {
+        row.push("│", frame);
+        row.pad_to(1 + pad, Style::default());
+        row.append(&inside);
+        row.pad_to(width - 1, Style::default());
+        row.push("│", frame);
+    };
+    let mut days = Row::default();
+    days.push("Su Mo Tu We Th Fr Sa", Style::fg(QUIETER));
+    let mut row = Row::default();
+    side(&mut row, days);
+    rows.push(row);
+
+    let lead = first.weekday().to_sunday_zero_offset() as usize;
+    for week in 0..6 {
+        let mut inside = Row::default();
+        for d in 0..7 {
+            if d > 0 {
+                inside.push(" ", Style::default());
+            }
+            let n = (week * 7 + d) as i64 - lead as i64 + 1;
+            let date = (1..=i64::from(first.days_in_month()))
+                .contains(&n)
+                .then(|| first.with().day(n as i8).build().ok())
+                .flatten();
+            let Some(date) = date else {
+                inside.push("  ", Style::default());
+                continue;
+            };
+            let style = Style {
+                bold: due.contains(&date),
+                ..match (Some(date) == day, date == today) {
+                    (true, _) => Style {
+                        fg: Some(ON_HIGHLIGHT),
+                        bg: Some(HIGHLIGHT),
+                        ..Style::default()
+                    },
+                    (false, true) => Style::fg(BLUE),
+                    (false, false) => Style::default(),
+                }
+            };
+            inside.push(&format!("{:>2}", date.day()), style);
+        }
+        let mut row = Row::default();
+        side(&mut row, inside);
+        rows.push(row);
+    }
+
+    let mut bottom = Row::default();
+    bottom.push("╰", frame);
+    let mut used = 1;
+    for (n, (keys, what)) in CAL_KEYS.iter().enumerate() {
+        let pair = keys.width() + 1 + what.width();
+        let gap = if n == 0 { 1 } else { 2 };
+        // Room for it, a space after, and the corner.
+        if used + gap + pair + 2 > width {
+            break;
+        }
+        bottom.push(&" ".repeat(gap), frame);
+        bottom.push(keys, Style::fg(QUIET));
+        bottom.push(&format!(" {what}"), Style::fg(QUIETER));
+        used += gap + pair;
+    }
+    bottom.push(" ", frame);
+    bottom.push(&"─".repeat(width - 1 - bottom.width), frame);
+    bottom.push("╯", frame);
+    rows.push(bottom);
+    rows
 }
 
 /// The footer's key hints that fit in `room` columns, in their order, each
@@ -1469,6 +1879,36 @@ fn giving_way<'a>(
         })
         .map(|i| (hints[i].0, hints[i].1))
         .collect()
+}
+
+/// `line` with `top` drawn over it from column `x`. What's under it is cut
+/// where it starts and where it ends, never a letter in half: a double-width
+/// one the start would split leaves a space in its own style, and one the end
+/// would split is covered whole, in `ground`.
+fn overlay(line: &Line, x: usize, top: &Row, ground: Style) -> Line {
+    let mut end = x + top.width;
+    let (mut before, mut after) = (Row::default(), Row::default());
+    let mut col = 0;
+    for span in line {
+        for ch in span.text.chars() {
+            let (a, b) = (col, col + ch.width().unwrap_or(0));
+            col = b;
+            if b <= x {
+                before.push_char(ch, span.style);
+            } else if a >= end {
+                after.push_char(ch, span.style);
+            } else if a < x {
+                before.pad_to(x, span.style);
+            } else if b > end {
+                end = b;
+            }
+        }
+    }
+    before.pad_to(x, Style::default());
+    before.append(top);
+    before.pad_to(end, ground);
+    before.append(&after);
+    before.spans
 }
 
 /// The status a column left (-1) or right (1) of `s`, if there's one.
@@ -1528,6 +1968,8 @@ struct Look {
     picked: bool,
     marked: bool,
     today: Date,
+    /// A card's count in red: a sub item folded away under it is late.
+    late_count: bool,
 }
 
 /// A card's or sub item's styles: plain, its title's, and quiet.
@@ -1650,6 +2092,13 @@ fn card(task: &Task, count: Option<&str>, look: Look) -> Vec<Row> {
         ..
     } = look;
     let (plain, title, quiet) = styles(picked);
+    let count_style = match look.late_count {
+        true => Style {
+            fg: Some(RED),
+            ..plain
+        },
+        false => quiet,
+    };
 
     // Room inside the card: a space of padding at each end, the mark and its space.
     let inner = width.saturating_sub(4);
@@ -1673,6 +2122,7 @@ fn card(task: &Task, count: Option<&str>, look: Look) -> Vec<Row> {
             title: &task.title,
             title_style: title,
             count,
+            count_style,
             tags,
             due: due_words(task, today),
         };
@@ -1684,7 +2134,7 @@ fn card(task: &Task, count: Option<&str>, look: Look) -> Vec<Row> {
     row.push(&shown, title);
     if let Some(count) = count {
         row.push("  ", plain);
-        row.push(count, quiet);
+        row.push(count, count_style);
     }
     if let Some(tags) = tags
         && room >= used + 2 + 3
@@ -1703,6 +2153,7 @@ struct Whole<'a> {
     title: &'a str,
     title_style: Style,
     count: Option<&'a str>,
+    count_style: Style,
     tags: Option<String>,
     due: Option<(String, bool)>,
 }
@@ -1726,12 +2177,14 @@ fn whole_row(head: Row, whole: Whole, look: Look, pad: usize, quiet: Style) -> V
     if line < room {
         let mut row = head;
         row.push(whole.title, whole.title_style);
-        for said in [whole.count.map(String::from), whole.tags]
-            .into_iter()
-            .flatten()
-        {
-            row.push("  ", plain);
-            row.push(&said, quiet);
+        for (said, style) in [
+            (whole.count.map(String::from), whole.count_style),
+            (whole.tags, quiet),
+        ] {
+            if let Some(said) = said {
+                row.push("  ", plain);
+                row.push(&said, style);
+            }
         }
         push_due(&mut row, whole.due, plain, quiet);
         row.push(" ", plain);
@@ -1790,7 +2243,7 @@ fn grow(
             && let Some(count) = whole.count
         {
             row.push("  ", plain);
-            row.push(count, quiet);
+            row.push(count, whole.count_style);
         }
         if k == last
             && tags_after
@@ -1867,6 +2320,7 @@ fn sub_item(task: &Task, look: Look) -> Vec<Row> {
             title: &task.title,
             title_style: title,
             count: None,
+            count_style: quiet,
             tags,
             due: due_words(task, today),
         };
@@ -1948,7 +2402,29 @@ struct Input {
     kind: InputKind,
     text: String,
     cursor: usize,
+    /// The calendar, while it's up.
+    cal: Option<Cal>,
 }
+
+/// The calendar a `//` typed in the input opens: where that `//` is, a byte
+/// index into the words. Its day is what the words after the `//` read as
+/// (see [`parse::marked_due`]), else the task's own on `e`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cal {
+    at: usize,
+}
+
+/// The calendar's card: 7 days of 2 cells and a space between, in a frame.
+const CAL_GRID: usize = 20;
+const CAL_ROWS: usize = 9;
+/// Its keys, on its bottom line.
+const CAL_KEYS: [(&str, &str); 4] = [
+    ("←→", "day"),
+    ("↑↓", "week"),
+    ("pgup pgdn", "month"),
+    ("esc", "close"),
+];
+const NO_ROOM_FOR_CAL: &str = "no room for the calendar — type the date";
 
 /// What the input is for: a new task, a new sub item of a card, the picked
 /// card or sub item, or the marked ones.
@@ -1964,7 +2440,42 @@ impl Input {
     /// The input with `text` filled in and the cursor at its end.
     fn new(kind: InputKind, text: String) -> Input {
         let cursor = text.len();
-        Input { kind, text, cursor }
+        Input {
+            kind,
+            text,
+            cursor,
+            cal: None,
+        }
+    }
+
+    /// Keeps the calendar's `//` in step with an edit that replaced `range`
+    /// of the words with `inserted` bytes, and closes it when the edit took
+    /// either `/`.
+    fn edited(&mut self, range: Range<usize>, inserted: usize) {
+        if let Some(cal) = &mut self.cal {
+            if range.end <= cal.at {
+                cal.at = cal.at - range.len() + inserted;
+            } else if range.start < cal.at + 2 {
+                self.cal = None;
+            }
+        }
+    }
+
+    /// Moves the calendar's day `by` and writes it after the `//`, in words
+    /// that read back as it, keeping the time: from the day the words read
+    /// as, else `own` (the task's on `e`), else `today`.
+    fn move_day(&mut self, by: jiff::Span, own: Option<Due>, now: DateTime, today: Date) {
+        let Some(cal) = self.cal else {
+            return;
+        };
+        let from = parse::marked_due(&self.text, cal.at, now).or(own);
+        let Ok(day) = from.map_or(today, |d| d.date).checked_add(by) else {
+            return;
+        };
+        let words = date::say(day, from.and_then(|d| d.time), today);
+        let span = parse::marked(&self.text, cal.at);
+        self.text.replace_range(span.clone(), &words);
+        self.cursor = span.start + words.len();
     }
 
     /// Where the grapheme before the cursor starts.
@@ -1985,18 +2496,19 @@ impl Input {
 }
 
 /// What fits of `s` in `max` columns with the cursor, at byte `at`, in view,
-/// and the cursor's column in it.
-fn view(s: &str, at: usize, max: usize) -> (String, usize) {
+/// the cursor's column in it, and the byte of `s` it starts at.
+fn view(s: &str, at: usize, max: usize) -> (String, usize, usize) {
     let before = &s[..at];
     if s.width() <= max {
-        return (s.into(), before.width());
+        return (s.into(), before.width(), 0);
     }
     if before.width() < max {
-        return (head(s, max), before.width());
+        return (head(s, max), before.width(), 0);
     }
     let shown = tail(before, max);
     let x = shown.width();
-    (shown, x)
+    let from = at - shown.len();
+    (shown, x, from)
 }
 
 /// The start of `s` that fits in `max` columns.
@@ -2066,6 +2578,17 @@ impl Row {
             text: text.into(),
             style,
         });
+    }
+
+    /// One letter more, in the last span when it has the same style.
+    fn push_char(&mut self, ch: char, style: Style) {
+        match self.spans.last_mut() {
+            Some(last) if last.style == style => {
+                last.text.push(ch);
+                self.width += ch.width().unwrap_or(0);
+            }
+            _ => self.push(ch.encode_utf8(&mut [0; 4]), style),
+        }
     }
 
     fn pad_to(&mut self, width: usize, style: Style) {
@@ -2228,6 +2751,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Picks column `c`'s first row, as a test sets it up (no key does).
+    fn go_to(board: &mut Board, c: usize) {
+        board.col = c;
+        board.row = 0;
     }
 
     fn picked_id(board: &Board) -> Option<u32> {
@@ -2680,7 +3209,7 @@ mod tests {
     fn while_marked_the_footer_says_how_many_and_what_acts_on_them() {
         let mut board = marked_sample();
         board.key(KeyEvent::from(KeyCode::BackTab));
-        press(&mut board, " ");
+        press(&mut board, "j ");
         assert_eq!(marks(&board), BTreeSet::from([1, 2, 3]));
         let (lines, _) = board.draw(100, 12);
         assert_eq!(
@@ -2820,18 +3349,14 @@ mod tests {
         press(&mut board, "e !high");
         assert!(enter(&mut board));
         assert_eq!(
-            (picked_id(&board), board.row[0]),
+            (picked_id(&board), board.row),
             (Some(1), 0),
             "high, and older"
         );
         press(&mut board, "j");
         press(&mut board, "e 2030-01-02");
         assert!(enter(&mut board));
-        assert_eq!(
-            (picked_id(&board), board.row[0]),
-            (Some(2), 0),
-            "dated first"
-        );
+        assert_eq!((picked_id(&board), board.row), (Some(2), 0), "dated first");
     }
 
     #[test]
@@ -3163,12 +3688,12 @@ mod tests {
             (46, "   sh…  2/4 "),
         ] {
             // Not picked: one line, cut to fit.
-            board.col = 1;
+            go_to(&mut board, 1);
             let (lines, _) = board.draw(w, 12);
             assert_eq!(cell(&lines[3], w, 0), want, "{w} wide");
             // Picked: its column wide when it fits there, else whole on
             // the line, `ship 0.2.0  2/4  +work  tomorrow` (35) and a cell.
-            board.col = 0;
+            go_to(&mut board, 0);
             let (lines, _) = board.draw(w, 12);
             let col_w = (w - 2 * MARGIN - 2 * GAP) / 3;
             assert_eq!(lit(&lines[3]), col_w.max(36), "{w} wide");
@@ -3432,7 +3957,7 @@ mod tests {
             .push(sub(task(9, "pump the tyres", Status::Todo, None, &[]), 3));
         press(&mut board, "jj ");
         board.key(KeyEvent::from(KeyCode::Tab));
-        press(&mut board, " ");
+        press(&mut board, "g ");
         assert_eq!(marks(&board), BTreeSet::from([3, 6]));
         run_keys(&mut board, "l");
         assert_eq!(
@@ -3467,7 +3992,7 @@ mod tests {
             .push(sub(task(9, "pump the tyres", Status::Todo, None, &[]), 3));
         press(&mut board, "jj ");
         board.key(KeyEvent::from(KeyCode::Tab));
-        press(&mut board, " ");
+        press(&mut board, "g ");
         run_keys(&mut board, "l");
         let (lines, _) = board.draw(100, 14);
         let stayed = "1 sub item stayed: a sub item moves with its task";
@@ -3583,7 +4108,7 @@ mod tests {
         let (lines, cursor) = board.draw(100, 12);
         let footer = text(&lines[11]);
         assert!(
-            footer.starts_with("  Sub item of 2  title friday"),
+            footer.starts_with("  Sub item of 2  title //fri 6pm"),
             "{footer:?}"
         );
         assert_eq!(cursor, Some(("  Sub item of 2  ".len() as u16, 11)));
@@ -3641,13 +4166,13 @@ mod tests {
             "  space mark  h l move  s doing  d done  a add  A sub  e edit  x remove  q quit "
         );
         // In Doing: no s.
-        board.col = 1;
+        go_to(&mut board, 1);
         assert_eq!(
             footer(&mut board, 80),
             "  space mark  h l move  t todo  d done  a add  A sub  e edit  x remove  q quit "
         );
         // In Done: no d.
-        board.col = 2;
+        go_to(&mut board, 2);
         assert_eq!(
             footer(&mut board, 120),
             "  j k pick  space mark  h l move  t todo  s doing  tab column  a add  A sub  e edit  y copy  x remove  q quit "
@@ -3657,13 +4182,13 @@ mod tests {
             "  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove  q quit "
         );
 
-        // A sub item picked: none of h l, t and s; the room brings j k and q
-        // back.
+        // A sub item picked: none of h l, t and s, and z for its card; the
+        // room brings j k back.
         let mut board = sub_sample();
         press(&mut board, "j");
         assert_eq!(
             footer(&mut board, 80),
-            "  j k pick  space mark  d done/open  a add  A sub  e edit  x remove  q quit "
+            "  j k pick  space mark  d done/open  a add  A sub  e edit  z fold  x remove "
         );
 
         let mut board = marked_sample();
@@ -3684,7 +4209,7 @@ mod tests {
         // room left goes back to those gone, the last to go first, one that
         // doesn't fit skipped.
         let mut board = sample();
-        board.col = 2;
+        go_to(&mut board, 2);
         for (w, want) in [
             (
                 85,
@@ -3708,15 +4233,15 @@ mod tests {
         for (w, want) in [
             (
                 76,
-                "  j k pick  space mark  d done/open  a add  A sub  e edit  x remove  q quit ",
+                "  j k pick  space mark  d done/open  a add  A sub  e edit  z fold  x remove ",
             ),
             (
                 66,
-                "  space mark  d done/open  a add  A sub  e edit  x remove  q quit ",
+                "  space mark  d done/open  a add  A sub  e edit  z fold  x remove ",
             ),
             (
                 56,
-                "  space mark  d done/open  a add  A sub  e edit  q quit ",
+                "  space mark  d done/open  a add  A sub  e edit  z fold ",
             ),
             (46, "  space mark  d done/open  a add  e edit "),
         ] {
@@ -3839,12 +4364,12 @@ mod tests {
         assert!(lines[4].iter().all(|s| s.style.bg.is_none()));
         assert!(!rows[0].contains("fix bike") && !rows[0].contains("call mum"));
 
-        // At 100 it ends inside Done: call mum, in a column it reaches into,
-        // isn't drawn on that line, never cut.
+        // At 100 it ends inside Done: call mum, under it, is cut where it
+        // ends, with no `…`.
         let rows = body(&mut board, 100, 14);
         assert_eq!(
             rows[0],
-            "   • write the quarterly report for the whole team  1/1  +work +q4  tomorrow"
+            "   • write the quarterly report for the whole team  1/1  +work +q4  tomorrow um"
         );
         let (lines, _) = board.draw(100, 14);
         assert_eq!(
@@ -3856,7 +4381,7 @@ mod tests {
         assert_eq!(cell(&lines[4], 100, 0).trim_end(), "     ● draft it");
 
         // Not picked: every row in its column, as ever.
-        board.col = 1;
+        go_to(&mut board, 1);
         let rows = body(&mut board, 100, 14);
         assert!(rows[0].starts_with("   • write the…  1/1"), "{:?}", rows[0]);
         assert!(rows[0].contains("fix bike") && rows[0].contains("call mum"));
@@ -3875,7 +4400,7 @@ mod tests {
             ],
             today(),
         );
-        board.col = 1;
+        go_to(&mut board, 1);
         let (lines, _) = board.draw(80, 12);
         let rows: Vec<String> = lines[3..6]
             .iter()
@@ -3908,11 +4433,55 @@ mod tests {
             )],
             today(),
         );
-        board.col = 2;
+        go_to(&mut board, 2);
         let (lines, _) = board.draw(80, 12);
         assert_eq!(cell(&lines[3], 80, 2).trim_end(), "   read the whole");
         assert_eq!(cell(&lines[4], 80, 2).trim_end(), "   lease again");
         assert_eq!(lit(&lines[3]), 23);
+
+        // Its wrapped lines are drawn over the rows under it, which stay
+        // where they are: the third row isn't pushed down.
+        board.tasks.extend([
+            task(2, "call mum", Status::Done, None, &[]),
+            task(3, "water plants", Status::Done, None, &[]),
+        ]);
+        let (lines, _) = board.draw(80, 12);
+        assert_eq!(cell(&lines[4], 80, 2).trim_end(), "   lease again");
+        assert_eq!(lit(&lines[4]), 23, "call mum under it");
+        assert_eq!(cell(&lines[5], 80, 2).trim_end(), "   water plants");
+        press(&mut board, "j");
+        let (lines, _) = board.draw(80, 12);
+        assert_eq!(cell(&lines[4], 80, 2).trim_end(), "   call mum");
+    }
+
+    #[test]
+    fn an_overlay_never_cuts_a_double_width_letter() {
+        let line = |s: &str| -> Line {
+            vec![Span {
+                text: s.into(),
+                style: Style::fg(QUIET),
+            }]
+        };
+        let mut top = Row::default();
+        top.push("XY", Style::fg(RED));
+        let ground = Style::fg(BLUE);
+        // Its end on 보's second cell: 보 covered whole, in the ground.
+        let over = overlay(&line("ab보고"), 1, &top, ground);
+        assert_eq!(text(&over), "aXY 고");
+        assert_eq!(over[2].style, ground);
+        // Its start on 보's second cell: a space where 보's first was.
+        let over = overlay(&line("a보cdef"), 2, &top, ground);
+        assert_eq!(text(&over), "a XYdef");
+        assert_eq!(
+            over[1],
+            Span {
+                text: " ".into(),
+                style: Style::fg(QUIET)
+            }
+        );
+        // Past the line's end, and on a short line.
+        assert_eq!(text(&overlay(&line("ab"), 4, &top, ground)), "ab  XY");
+        assert_eq!(text(&overlay(&line("abcdef"), 0, &top, ground)), "XYcdef");
     }
 
     #[test]
@@ -3958,11 +4527,11 @@ mod tests {
             )],
             today(),
         );
-        // Into Doing, whose "Nothing here" isn't drawn; Done's is.
+        // Into Doing, whose "Nothing here" is cut where it ends; Done's whole.
         assert_eq!(
             body(&mut board, 60, 10)[..2],
             [
-                "     tax form  in 7 weeks                  Nothing here",
+                "     tax form  in 7 weeks thing here       Nothing here",
                 ""
             ]
         );
@@ -4052,7 +4621,7 @@ mod tests {
         ));
         tasks.extend((9..=16).map(|id| task(id, &format!("todo {id}"), Status::Todo, None, &[])));
         let mut board = Board::new(tasks, today());
-        board.col = 2;
+        go_to(&mut board, 2);
         press(&mut board, "G");
         // Five rows of body: two cards above, then the last one whole.
         assert_eq!(
@@ -4092,6 +4661,7 @@ mod tests {
                 title,
                 title_style,
                 count: None,
+                count_style: quiet,
                 tags: tags.map(String::from),
                 due: Some(("in 7 weeks".into(), false)),
             };
@@ -4210,9 +4780,10 @@ mod tests {
     }
 
     #[test]
-    fn a_neighbours_row_is_whole_or_not_there_never_cut() {
-        // The footer-80 frame that showed `x bike`: pay rent with its count
-        // and tags reaches into Doing; Done it doesn't reach.
+    fn a_neighbours_row_is_cut_where_the_picked_row_ends() {
+        // pay rent with its count and tags reaches into Doing: fix bike is
+        // drawn as ever, cut where pay rent's ground ends; Done it doesn't
+        // reach.
         let mut board = sub_sample();
         board.tasks[3] = task(4, "call mum", Status::Done, None, &[]);
         let (lines, _) = board.draw(80, 14);
@@ -4221,8 +4792,8 @@ mod tests {
             .map(|l| text(l).trim_end().to_string())
             .collect();
         assert_eq!(
-            rows[0], "   • pay rent  1/3  +home +money                         call mum",
-            "Doing's row not there, Done's whole"
+            rows[0], "   • pay rent  1/3  +home +money x bike                  call mum",
+            "Doing's row cut, no `…`; Done's whole"
         );
         assert_eq!(
             cell(&lines[3], 80, 2).trim_end(),
@@ -4230,15 +4801,18 @@ mod tests {
             "in its place"
         );
         assert_eq!(lit(&lines[3]), 31, "the ground one cell past the text");
+        // fix bike's priority dot and the rest in their own colours.
+        let bike = lines[3].iter().find(|s| s.text.contains("x bike")).unwrap();
+        assert_eq!(bike.style, Style::default());
         assert!(
             rows[1].starts_with("       ● ask for the bi…"),
             "{:?}",
             rows[1]
         );
-        assert!(!rows.iter().any(|r| r.contains("x bike")));
 
-        // A Korean title in Doing under a Todo row shown whole: not there,
-        // and no letter cut in half; the column it doesn't reach is drawn.
+        // A Korean title in Doing under a Todo row shown whole: 고 under the
+        // cell after +work is covered whole, never cut in half; 서 on, and
+        // the column it doesn't reach, drawn as ever.
         let mut board = Board::new(
             vec![
                 task(
@@ -4255,12 +4829,12 @@ mod tests {
         let rows = body(&mut board, 80, 10);
         assert_eq!(
             rows[0],
-            "     write the quarterly report  +work                   Nothing here"
+            "     write the quarterly report  +work  서 초안          Nothing here"
         );
         let (lines, _) = board.draw(80, 10);
-        assert_eq!(cell(&lines[3], 80, 2).trim_end(), "   Nothing here");
+        assert_eq!(lit(&lines[3]), 38, "the text, a cell, and 고's two");
         // Not picked, it's there, whole.
-        board.col = 1;
+        go_to(&mut board, 1);
         assert!(body(&mut board, 80, 10)[0].contains("분기 보고서 초안"));
     }
 
@@ -4293,8 +4867,7 @@ mod tests {
         board.key(KeyEvent::from(KeyCode::BackTab));
         press(&mut board, "jjjj ");
         board.key(KeyEvent::from(KeyCode::BackTab));
-        board.col = 0;
-        board.row[0] = 0;
+        go_to(&mut board, 0);
         press(&mut board, "jj ");
         assert_eq!(marks(&board), BTreeSet::from([1, 3, 6]));
         assert_eq!(
@@ -4811,18 +5384,778 @@ mod tests {
         for id in [2, 5, 6, 7] {
             assert_eq!(status(&board, id), Status::Done);
         }
-        board.col = 2;
-        board.row[2] = ids(&board, 2).iter().position(|&id| id == 2).unwrap();
+        go_to(&mut board, 2);
+        board.row = ids(&board, 2).iter().position(|&id| id == 2).unwrap();
         run_keys(&mut board, "s");
         assert_eq!(status(&board, 2), Status::Doing);
         for id in [5, 6, 7] {
             assert_eq!(status(&board, id), Status::Done, "{id} stays done");
         }
-        board.col = 1;
-        board.row[1] = 0;
+        go_to(&mut board, 1);
         run_keys(&mut board, "t");
         assert_eq!(status(&board, 2), Status::Todo);
         assert_eq!(status(&board, 6), Status::Done);
+    }
+
+    // Going to another column: the row on the same line.
+
+    /// Todo 1 to 4, Doing 5 to 8, Done 9 and 10, each titled by its id.
+    fn lines_sample() -> Board {
+        let at = |id: u32, status| task(id, &format!("task {id}"), status, None, &[]);
+        let mut tasks: Vec<Task> = (1..=4).map(|id| at(id, Status::Todo)).collect();
+        tasks.extend((5..=8).map(|id| at(id, Status::Doing)));
+        tasks.extend((9..=10).map(|id| at(id, Status::Done)));
+        Board::new(tasks, today())
+    }
+
+    #[test]
+    fn tab_lands_on_the_row_on_the_same_line() {
+        let mut board = lines_sample();
+        press(&mut board, "jj");
+        assert_eq!(picked_id(&board), Some(3), "row three in Todo");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(
+            (board.col, picked_id(&board)),
+            (1, Some(7)),
+            "row three in Doing"
+        );
+        // The arrows the same.
+        key(&mut board, KeyCode::Left);
+        assert_eq!(picked_id(&board), Some(3));
+        key(&mut board, KeyCode::Right);
+        assert_eq!(picked_id(&board), Some(7));
+    }
+
+    #[test]
+    fn a_shorter_column_lands_on_its_last_row() {
+        let mut board = lines_sample();
+        press(&mut board, "jjj");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!((board.col, picked_id(&board)), (2, Some(10)), "Done's last");
+        key(&mut board, KeyCode::Right);
+        assert_eq!(
+            (board.col, picked_id(&board)),
+            (2, Some(10)),
+            "no column past it"
+        );
+    }
+
+    #[test]
+    fn an_empty_column_takes_the_pick_as_ever() {
+        let mut board = lines_sample();
+        board.tasks.retain(|t| t.status != Status::Doing);
+        press(&mut board, "jj");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!((board.col, board.row, picked_id(&board)), (1, 0, None));
+        assert!(body(&mut board, 80, 12)[0].contains("Nothing here"));
+        // On from it: its first line, Done's first row.
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!((board.col, picked_id(&board)), (2, Some(9)));
+    }
+
+    #[test]
+    fn there_and_back_lands_on_the_same_line_each_way() {
+        let mut board = lines_sample();
+        press(&mut board, "jjj");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picked_id(&board), Some(8));
+        press(&mut board, "k");
+        // Back on row three, not on row four, where Todo's pick was.
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!((board.col, picked_id(&board)), (0, Some(3)));
+        press(&mut board, "g");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picked_id(&board), Some(5));
+    }
+
+    #[test]
+    fn from_a_sub_items_line_and_onto_one() {
+        // Todo: pay rent, its sub items 5, 6 and 7, buy milk, the orphan.
+        let mut board = sub_sample();
+        board.tasks.extend([
+            task(9, "oil the chain", Status::Doing, None, &[]),
+            task(10, "wash the bike", Status::Doing, None, &[]),
+        ]);
+        press(&mut board, "jj");
+        assert_eq!(picked_id(&board), Some(6), "a sub item, line three");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picked_id(&board), Some(10), "Doing's row three");
+        press(&mut board, "k");
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(picked_id(&board), Some(5), "onto the sub item on its line");
+    }
+
+    #[test]
+    fn the_same_line_is_by_what_is_drawn_and_a_wrapped_rows_first() {
+        // Todo of 20, scrolled to its end in five lines of body; Doing of 10.
+        let mut tasks: Vec<Task> = (1..=20)
+            .map(|id| task(id, &format!("todo {id}"), Status::Todo, None, &[]))
+            .collect();
+        tasks
+            .extend((21..=30).map(|id| task(id, &format!("doing {id}"), Status::Doing, None, &[])));
+        let mut board = Board::new(tasks, today());
+        press(&mut board, "G");
+        let (lines, _) = board.draw(80, 10);
+        assert_eq!(cell(&lines[7], 80, 0).trim_end(), "   todo 20", "line five");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picked_id(&board), Some(25), "Doing's line five");
+        board.draw(80, 10);
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(
+            picked_id(&board),
+            Some(20),
+            "Todo's line five, as it's drawn"
+        );
+
+        // A picked row wrapped over the lines under it: its first line.
+        let mut board = lines_sample();
+        board.tasks[1].title =
+            "a title long enough to wrap past the edge of the whole board at eighty".repeat(2);
+        press(&mut board, "j");
+        assert!(
+            board.draw(80, 12).0[5]
+                .iter()
+                .any(|s| s.style.bg == Some(HIGHLIGHT)),
+            "wrapped"
+        );
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picked_id(&board), Some(6));
+    }
+
+    // The calendar.
+
+    /// The `n` cells of a drawn line from cell `x`.
+    fn cells(line: &Line, x: usize, n: usize) -> String {
+        text(line).chars().skip(x).take(n).collect()
+    }
+
+    /// The day the calendar shows picked, by the picked row's colours.
+    fn cal_picked(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .flatten()
+            .filter(|s| s.style.bg == Some(HIGHLIGHT) && s.style.fg == Some(ON_HIGHLIGHT))
+            .filter(|s| s.text.trim().parse::<u8>().is_ok())
+            .map(|s| s.text.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn two_slashes_open_the_calendar_above_the_typing_line_at_them() {
+        let mut board = sample();
+        press(&mut board, "apay rent /");
+        assert_eq!(board.input.as_ref().unwrap().cal, None, "one is a letter");
+        press(&mut board, "/");
+        assert_eq!(board.input.as_ref().unwrap().cal, Some(Cal { at: 9 }));
+        let (lines, _) = board.draw(80, 20);
+        // Its left edge at the `//` (after `  New task  `), its foot right
+        // above the typing line.
+        assert_eq!(cells(&lines[10], 21, 17), "╭ November 2026 ─");
+        assert_eq!(cells(&lines[11], 21, 1), "│");
+        assert!(cells(&lines[11], 22, 45).contains("Su Mo Tu We Th Fr Sa"));
+        assert!(
+            cells(&lines[12], 22, 45).contains(" 1  2  3  4  5  6  7"),
+            "Sunday first"
+        );
+        assert_eq!(
+            cells(&lines[18], 21, 47),
+            "╰ ←→ day  ↑↓ week  pgup pgdn month  esc close ╯"
+        );
+        assert!(
+            text(&lines[19]).contains("pay rent //"),
+            "the typing line free"
+        );
+        // The weekdays faint, today (the 11th) in the accent, none picked.
+        assert_eq!(
+            span(&lines[11], "Su Mo Tu We Th Fr Sa").style.fg,
+            Some(QUIETER)
+        );
+        assert_eq!(span(&lines[13], "11").style.fg, Some(BLUE));
+        assert!(cal_picked(&lines).is_empty());
+
+        // Typing stays typing; the calendar follows what the words read as.
+        press(&mut board, "fri");
+        assert_eq!(typed(&board), Some("pay rent //fri"));
+        assert_eq!(cal_picked(&board.draw(80, 20).0), ["13"]);
+        press(&mut board, "dya");
+        let (lines, _) = board.draw(80, 20);
+        assert!(cal_picked(&lines).is_empty());
+        assert_eq!(
+            (board.message.as_deref(), text(&lines[18]).contains("isn't")),
+            (None, false),
+            "no error while typing"
+        );
+        // The month of the day it reads.
+        key(&mut board, KeyCode::Backspace);
+        key(&mut board, KeyCode::Backspace);
+        key(&mut board, KeyCode::Backspace);
+        press(&mut board, " 6pm +home");
+        assert_eq!(cal_picked(&board.draw(80, 20).0), ["13"]);
+        press(&mut board, "x");
+        for _ in 0..14 {
+            key(&mut board, KeyCode::Backspace);
+        }
+        press(&mut board, "jan 3");
+        assert_eq!(typed(&board), Some("pay rent //jan 3"));
+        assert!(text(&board.draw(80, 20).0[10]).contains("January 2027"));
+    }
+
+    #[test]
+    fn the_calendars_keys_move_the_day_and_write_it_after_the_slashes() {
+        let mut board = sample();
+        press(&mut board, "apay //");
+        let now = today().to_datetime(jiff::civil::Time::midnight());
+        // The first move from today, the 11th; each written as halil reads it.
+        for (code, want, day) in [
+            (KeyCode::Right, "pay //nov 12", "2026-11-12"),
+            (KeyCode::Left, "pay //nov 11", "2026-11-11"),
+            (KeyCode::Left, "pay //2026-11-10", "2026-11-10"),
+            (KeyCode::Down, "pay //nov 17", "2026-11-17"),
+            (KeyCode::Up, "pay //2026-11-10", "2026-11-10"),
+            (KeyCode::PageDown, "pay //dec 10", "2026-12-10"),
+            (KeyCode::PageDown, "pay //2027-01-10", "2027-01-10"),
+            (KeyCode::PageUp, "pay //dec 10", "2026-12-10"),
+        ] {
+            key(&mut board, code);
+            assert_eq!(typed(&board), Some(want), "{code:?}");
+            assert_eq!(
+                parse::marked_due(want, 4, now).unwrap().to_string(),
+                day,
+                "{want} reads back as {day}"
+            );
+            assert_eq!(
+                cal_picked(&board.draw(80, 20).0),
+                [day[8..].trim_start_matches('0')]
+            );
+        }
+        let input = board.input.as_ref().unwrap();
+        assert_eq!(input.cursor, input.text.len(), "the cursor after the day");
+
+        // From the day typed, a typed time kept, the words after it too.
+        let mut board = sample();
+        press(&mut board, "apay //fri 18:00 +home");
+        key(&mut board, KeyCode::Right);
+        assert_eq!(typed(&board), Some("pay //nov 14 6pm +home"));
+        // enter adds it, once.
+        match key(&mut board, KeyCode::Enter) {
+            Outcome::Change(Op::Add { task, .. }) => {
+                assert_eq!(task.title, "pay");
+                assert_eq!(task.due.unwrap().to_string(), "2026-11-14 18:00");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(board.input, None);
+    }
+
+    #[test]
+    fn esc_closes_the_calendar_then_the_typing_and_only_slashes_open_it_again() {
+        let mut board = sample();
+        press(&mut board, "ax //fri");
+        key(&mut board, KeyCode::Esc);
+        assert_eq!(board.input.as_ref().unwrap().cal, None);
+        assert_eq!(typed(&board), Some("x //fri"), "the words left");
+        assert!(!text(&board.draw(80, 20).0[10]).contains("╭"));
+        // The arrows are the cursor's again.
+        key(&mut board, KeyCode::Left);
+        assert_eq!(board.input.as_ref().unwrap().cursor, 6);
+        key(&mut board, KeyCode::Right);
+        press(&mut board, " 6pm");
+        assert_eq!(
+            board.input.as_ref().unwrap().cal,
+            None,
+            "typing doesn't open it"
+        );
+        press(&mut board, " //");
+        assert_eq!(board.input.as_ref().unwrap().cal, Some(Cal { at: 12 }));
+        // Backspace over a `/` closes it; a / typed back opens it.
+        key(&mut board, KeyCode::Backspace);
+        assert_eq!(board.input.as_ref().unwrap().cal, None);
+        press(&mut board, "/");
+        assert!(board.input.as_ref().unwrap().cal.is_some());
+        // A letter typed before it keeps it where its `//` went.
+        ctrl(&mut board, 'a');
+        press(&mut board, "y");
+        assert_eq!(board.input.as_ref().unwrap().cal, Some(Cal { at: 13 }));
+        key(&mut board, KeyCode::Esc);
+        key(&mut board, KeyCode::Esc);
+        assert_eq!(board.input, None, "a second esc leaves typing");
+    }
+
+    #[test]
+    fn on_e_the_calendar_opens_on_the_tasks_own_date() {
+        let mut board = sample();
+        board.tasks[1].due = Some("2026-12-04 09:00".parse().unwrap());
+        press(&mut board, "e");
+        assert_eq!(typed(&board), Some("pay rent"));
+        press(&mut board, " //");
+        let (lines, _) = board.draw(80, 20);
+        assert!(text(&lines[10]).contains("December 2026"));
+        assert_eq!(cal_picked(&lines), ["4"]);
+        // The first move from it, its time with it, in the line to see.
+        key(&mut board, KeyCode::Right);
+        assert_eq!(typed(&board), Some("pay rent //dec 5 9am"));
+        assert!(enter(&mut board));
+        assert_eq!(
+            by_id(&board, 2).due.unwrap().to_string(),
+            "2026-12-05 09:00"
+        );
+        assert_eq!(by_id(&board, 2).title, "pay rent");
+    }
+
+    #[test]
+    fn without_room_there_is_no_calendar_and_the_row_above_says_so() {
+        let mut board = sample();
+        press(&mut board, "ax //");
+        let (lines, _) = board.draw(80, 9);
+        assert_eq!(
+            text(&lines[7]).trim_end(),
+            "  no room for the calendar — type the date"
+        );
+        assert!(!lines.iter().any(|l| text(l).contains('╭')));
+        // The arrows are the cursor's, and esc leaves typing.
+        key(&mut board, KeyCode::Left);
+        assert_eq!(typed(&board), Some("x //"));
+        assert_eq!(board.input.as_ref().unwrap().cursor, 3);
+        // Typed, the date reads as ever.
+        press(&mut board, "/fri");
+        key(&mut board, KeyCode::End);
+        let (lines, _) = board.draw(80, 10);
+        assert!(
+            lines[0..9].iter().any(|l| text(l).contains('╭')),
+            "10 rows: room"
+        );
+        let (_, _) = board.draw(80, 9);
+        key(&mut board, KeyCode::Esc);
+        assert_eq!(board.input, None);
+    }
+
+    #[test]
+    fn the_calendars_keys_give_way_from_the_right_and_due_days_are_bold() {
+        let due = BTreeSet::from([jiff::civil::date(2026, 11, 20)]);
+        let card = calendar(None, today(), &due, 22);
+        assert_eq!(card.len(), CAL_ROWS);
+        let rows: Vec<String> = card.iter().map(|r| text(&r.spans)).collect();
+        assert_eq!(rows[0], "╭ November 2026 ─────╮");
+        assert_eq!(rows[1], "│Su Mo Tu We Th Fr Sa│");
+        assert_eq!(rows[2], "│ 1  2  3  4  5  6  7│");
+        assert_eq!(rows[6], "│29 30               │");
+        assert_eq!(rows[7], "│                    │");
+        assert_eq!(rows[8], "╰ ←→ day  ↑↓ week ───╯");
+        assert!(card.iter().all(|r| r.width == 22));
+        assert!(span(&card[4].spans, "20").style.bold);
+        assert!(!span(&card[4].spans, "19").style.bold);
+        // Whole pairs from the left: esc close would fit after week, but
+        // it gives way with pgup pgdn month.
+        let card = calendar(None, today(), &due, 32);
+        assert_eq!(
+            text(&card[8].spans),
+            format!("╰ ←→ day  ↑↓ week {}╯", "─".repeat(13))
+        );
+        let card = calendar(None, today(), &due, 38);
+        assert!(text(&card[8].spans).starts_with("╰ ←→ day  ↑↓ week  pgup pgdn month ─"));
+        let card = calendar(None, today(), &due, 47);
+        assert_eq!(
+            text(&card[8].spans),
+            "╰ ←→ day  ↑↓ week  pgup pgdn month  esc close ╯"
+        );
+    }
+
+    #[test]
+    fn the_board_reads_slashes_as_halil_does_and_refuses_as_it_does() {
+        let mut board = sample();
+        for (words, err) in [
+            ("ax //fridya", "`//fridya` isn't a date"),
+            ("ax //", "`//` needs a date"),
+        ] {
+            press(&mut board, words);
+            assert!(!enter(&mut board));
+            assert_eq!(board.message.as_deref(), Some(err));
+            assert_eq!(typed(&board), Some(&words[1..]), "the words kept");
+            key(&mut board, KeyCode::Esc);
+        }
+        // On e, after the title filled in.
+        press(&mut board, "e //fri");
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, 2).title, "pay rent");
+        assert_eq!(by_id(&board, 2).due.unwrap().to_string(), "2026-11-13");
+        press(&mut board, "aplan the friday party //tomorrow +home");
+        assert!(enter(&mut board));
+        let added = board.tasks.last().unwrap();
+        assert_eq!(added.title, "plan the friday party");
+        assert_eq!(added.due.unwrap().to_string(), "2026-11-12");
+    }
+
+    #[test]
+    fn the_calendar_stays_inside_the_screen() {
+        let mut board = sample();
+        press(&mut board, "a");
+        press(&mut board, &"x".repeat(40));
+        press(&mut board, " //");
+        let (lines, _) = board.draw(60, 20);
+        // The `//` at 53: the card's 47 cells end at the screen's.
+        assert_eq!(cells(&lines[10], 13, 1), "╭");
+        assert_eq!(text(&lines[10]).chars().count(), 60);
+    }
+
+    // Folding.
+
+    /// The span of a drawn line whose text is `s`.
+    fn span<'a>(line: &'a Line, s: &str) -> &'a Span {
+        line.iter()
+            .find(|span| span.text == s)
+            .unwrap_or_else(|| panic!("no {s:?} in {:?}", text(line)))
+    }
+
+    #[test]
+    fn z_folds_the_picked_card_and_z_again_unfolds_it() {
+        let mut board = sub_sample();
+        assert_eq!(ids(&board, 0), [2, 5, 6, 7, 1, 8]);
+        press(&mut board, "z");
+        assert_eq!(ids(&board, 0), [2, 1, 8], "its sub items not drawn");
+        assert_eq!(picked_id(&board), Some(2));
+        let (lines, _) = board.draw(100, 12);
+        assert!(
+            text(&lines[3]).starts_with("   • pay rent  ▸ 1/3  +home"),
+            "{:?}",
+            text(&lines[3])
+        );
+        assert_eq!(span(&lines[3], "▸ 1/3").style.fg, Some(QUIET_ON_HIGHLIGHT));
+        assert_eq!(cell(&lines[4], 100, 0).trim_end(), "   buy milk");
+        // j and k step past them.
+        press(&mut board, "j");
+        assert_eq!(picked_id(&board), Some(1));
+        press(&mut board, "k");
+        assert_eq!(picked_id(&board), Some(2));
+        // Again: open, as it was.
+        press(&mut board, "z");
+        assert_eq!(ids(&board, 0), [2, 5, 6, 7, 1, 8]);
+        let (lines, _) = board.draw(100, 12);
+        assert!(text(&lines[3]).starts_with("   • pay rent  1/3  +home"));
+
+        // On a sub item: its card folds, and the pick goes to it.
+        press(&mut board, "jj");
+        assert_eq!(picked_id(&board), Some(6));
+        press(&mut board, "z");
+        assert_eq!(
+            (ids(&board, 0), picked_id(&board)),
+            (vec![2, 1, 8], Some(2))
+        );
+        // ㅋ is z.
+        press(&mut board, "ㅋ");
+        assert_eq!(ids(&board, 0), [2, 5, 6, 7, 1, 8]);
+
+        // Nothing to fold: a card without sub items, and in Done.
+        press(&mut board, "G");
+        press(&mut board, "z");
+        assert_eq!(board.message.as_deref(), Some("8 has no sub items to fold"));
+        board
+            .tasks
+            .push(sub(task(9, "ring them", Status::Done, None, &[]), 4));
+        go_to(&mut board, 2);
+        press(&mut board, "z");
+        assert_eq!(
+            board.message.as_deref(),
+            Some("in Done, sub items are folded into the count")
+        );
+        assert!(board.folded.is_empty());
+    }
+
+    #[test]
+    fn the_footer_offers_z_only_where_it_acts() {
+        let mut board = sub_sample();
+        assert!(footer(&mut board, 120).contains(" z fold "));
+        press(&mut board, "z");
+        assert!(footer(&mut board, 120).contains(" z unfold "));
+        // Not on a card without sub items.
+        press(&mut board, "j");
+        assert!(!footer(&mut board, 120).contains(" z "));
+        // On a sub item, for its card.
+        press(&mut board, "kz");
+        press(&mut board, "j");
+        assert_eq!(picked_id(&board), Some(5));
+        assert!(footer(&mut board, 120).contains(" z fold "));
+        // Not in Done, a card with sub items or not.
+        board
+            .tasks
+            .push(sub(task(9, "ring them", Status::Done, None, &[]), 4));
+        go_to(&mut board, 2);
+        assert!(!footer(&mut board, 120).contains(" z "));
+    }
+
+    #[test]
+    fn a_folded_card_never_hides_whats_due() {
+        // A card due in 7 weeks, with an open sub item due tomorrow, one
+        // late, and a done one due long ago; a card due friday beside it.
+        let mut board = Board::new(
+            vec![
+                due(task(1, "move house", Status::Todo, None, &[]), "2026-12-30"),
+                due(task(2, "pay rent", Status::Todo, None, &[]), "2026-11-13"),
+                sub(
+                    due(
+                        task(3, "book the van", Status::Todo, None, &[]),
+                        "2026-11-12",
+                    ),
+                    1,
+                ),
+                sub(
+                    due(task(4, "old boxes", Status::Done, None, &[]), "2026-10-01"),
+                    1,
+                ),
+            ],
+            today(),
+        );
+        assert_eq!(ids(&board, 0), [2, 1, 3, 4]);
+        board.pick(1);
+        press(&mut board, "z");
+        // Folded, it shows tomorrow, its open sub item's, and sorts by it.
+        assert_eq!(ids(&board, 0), [1, 2]);
+        assert_eq!(picked_id(&board), Some(1), "the pick goes with it");
+        let (lines, _) = board.draw(100, 12);
+        assert!(text(&lines[3]).contains("move house  ▸ 1/2"));
+        assert!(cell(&lines[3], 100, 0).trim_end().ends_with("tomorrow"));
+        assert_eq!(
+            span(&lines[3], "▸ 1/2").style.fg,
+            Some(QUIET_ON_HIGHLIGHT),
+            "none late"
+        );
+        // Unfolded, its own date again; nothing written to the task.
+        press(&mut board, "z");
+        assert_eq!(by_id(&board, 1).due.unwrap().to_string(), "2026-12-30");
+        let (lines, _) = board.draw(100, 12);
+        assert!(cell(&lines[4], 100, 0).trim_end().ends_with("in 7 weeks"));
+
+        // A late one inside: the count red, and the card's date its.
+        board.tasks[2].due = Some("2026-11-09".parse().unwrap());
+        board.pick(1);
+        press(&mut board, "z");
+        board.pick(2);
+        let (lines, _) = board.draw(120, 12);
+        assert_eq!(span(&lines[3], "▸ 1/2").style.fg, Some(RED));
+        assert!(cell(&lines[3], 120, 0).trim_end().ends_with("2 days ago"));
+        assert_eq!(span(&lines[3], "2 days ago").style.fg, Some(RED));
+        // And on a card with no date of its own.
+        board.tasks[0].due = None;
+        let (lines, _) = board.draw(120, 12);
+        assert!(cell(&lines[3], 120, 0).trim_end().ends_with("2 days ago"));
+        // A hidden one due after the card's own date leaves the card's.
+        board.tasks.push(sub(
+            due(task(5, "pay it", Status::Todo, None, &[]), "2026-12-01"),
+            2,
+        ));
+        board.pick(2);
+        press(&mut board, "z");
+        let (lines, _) = board.draw(120, 12);
+        assert!(
+            text(&lines[4]).contains("pay rent  ▸ 0/1"),
+            "{:?}",
+            text(&lines[4])
+        );
+        assert!(
+            cell(&lines[4], 120, 0).trim_end().ends_with("in 2 days"),
+            "{:?}",
+            text(&lines[4])
+        );
+        press(&mut board, "z");
+        // Not when it's done.
+        board.tasks[2].status = Status::Done;
+        let (lines, _) = board.draw(120, 12);
+        let house = lines
+            .iter()
+            .find(|l| text(l).contains("move house"))
+            .unwrap();
+        assert_ne!(span(house, "▸ 2/2").style.fg, Some(RED));
+        assert!(!text(house).contains("ago"));
+    }
+
+    #[test]
+    fn a_fold_that_moves_the_card_says_why_and_its_unfold_too() {
+        // move house, due in 7 weeks, under pay rent, due friday; its open
+        // sub item is due tomorrow.
+        let mut board = Board::new(
+            vec![
+                due(task(1, "move house", Status::Todo, None, &[]), "2026-12-30"),
+                due(task(2, "pay rent", Status::Todo, None, &[]), "2026-11-13"),
+                sub(
+                    due(
+                        task(3, "book the van", Status::Todo, None, &[]),
+                        "2026-11-12",
+                    ),
+                    1,
+                ),
+            ],
+            today(),
+        );
+        board.pick(1);
+        press(&mut board, "z");
+        assert_eq!(ids(&board, 0), [1, 2]);
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Sorted by its sub item's date now: tomorrow.")
+        );
+        let (lines, _) = board.draw(100, 12);
+        assert!(text(&lines[10]).contains("Sorted by its sub item's date now: tomorrow."));
+        press(&mut board, "z");
+        assert_eq!(ids(&board, 0), [2, 1, 3]);
+        assert_eq!(board.note.as_deref(), Some("Sorted by its own date again."));
+
+        // Its place the same, folded or not: nothing said.
+        board.tasks[2].parent = Some(2);
+        board.pick(2);
+        press(&mut board, "z");
+        assert_eq!(ids(&board, 0), [2, 1]);
+        assert_eq!(board.note, None);
+        press(&mut board, "z");
+        assert_eq!(board.note, None);
+    }
+
+    #[test]
+    fn capital_a_on_a_folded_card_unfolds_it_and_another_halils_sub_leaves_it_folded() {
+        let mut board = sub_sample();
+        press(&mut board, "z");
+        // `halil sub 2 …` in another terminal: the count, still folded.
+        let mut tasks = board.tasks.clone();
+        tasks.push(sub(
+            task(9, "print the receipt", Status::Todo, None, &[]),
+            2,
+        ));
+        board.replace_tasks(tasks);
+        assert_eq!(ids(&board, 0), [2, 1, 8]);
+        let (lines, _) = board.draw(100, 12);
+        assert!(text(&lines[3]).contains("▸ 1/4"));
+        // A opens it, and its words.
+        press(&mut board, "A");
+        assert_eq!(ids(&board, 0), [2, 5, 6, 7, 9, 1, 8]);
+        assert_eq!(
+            board.input.as_ref().map(|i| i.kind),
+            Some(InputKind::Sub(r(2)))
+        );
+        assert!(board.folds_changed);
+    }
+
+    #[test]
+    fn folding_clears_its_sub_items_marks_and_says_how_many() {
+        let mut board = sub_sample();
+        press(&mut board, "  ");
+        press(&mut board, "j ");
+        assert_eq!(marks(&board), BTreeSet::from([2, 5, 7]));
+        press(&mut board, "gz");
+        assert_eq!(marks(&board), BTreeSet::from([2]), "the card's own stays");
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Cleared the marks on its 2 sub items.")
+        );
+        press(&mut board, "zj ");
+        press(&mut board, "k");
+        press(&mut board, "z");
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Cleared the mark on its sub item.")
+        );
+        press(&mut board, "z");
+        press(&mut board, "z");
+        assert_eq!(board.note, None, "none to clear: nothing said");
+    }
+
+    #[test]
+    fn keys_on_a_folded_card_act_on_the_card() {
+        let mut board = sub_sample();
+        press(&mut board, "z");
+        // x still names its sub items.
+        press(&mut board, "x");
+        let (lines, _) = board.draw(100, 12);
+        assert!(
+            text(&lines[11]).contains("Remove 2 \"pay rent\" and its 3 sub items?"),
+            "{:?}",
+            text(&lines[11])
+        );
+        press(&mut board, "n");
+        assert_eq!(
+            press(&mut board, "y"),
+            [Outcome::Copy {
+                text: "pay rent".into(),
+                what: "\"pay rent\"".into()
+            }]
+        );
+        // s moves it, folded still; d finishes it and its open sub items.
+        run_keys(&mut board, "s");
+        go_to(&mut board, 1);
+        assert_eq!(ids(&board, 1), [2, 3]);
+        run_keys(&mut board, "t");
+        board.pick(2);
+        assert_eq!(ids(&board, 0), [2, 1, 8]);
+        run_keys(&mut board, "d");
+        assert!(
+            board
+                .tasks
+                .iter()
+                .filter(|t| t.parent == Some(2))
+                .all(|t| t.status == Status::Done)
+        );
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Done, with its 2 open sub items.")
+        );
+    }
+
+    /// A fresh, empty folder for one test, under the system's temp folder.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("halil-board-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn folds_are_kept_beside_the_tasks_file_across_a_restart() {
+        let dir = scratch("folds");
+        let path = dir.join("tasks.jsonl");
+        let mut board = sub_sample();
+        board.tasks[1].stamp = 1_763_500_000_002;
+        store::save(&path, &board.tasks).unwrap();
+        let tasks_before = fs::read_to_string(&path).unwrap();
+        press(&mut board, "z");
+        board.keep_folds(&path);
+        assert!(!board.folds_changed);
+        let kept = fs::read_to_string(dir.join("board.json")).unwrap();
+        assert_eq!(kept, "{\"folded\":[{\"id\":2,\"stamp\":1763500000002}]}\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            tasks_before,
+            "the tasks untouched"
+        );
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["board.json", "tasks.jsonl"], "no temp file left");
+
+        // The next run: folded.
+        let mut next = Board::new(store::load(&path).unwrap(), today());
+        next.folded = load_folds(&folds_path(&path));
+        next.keep_folds_in_sight();
+        assert_eq!(ids(&next, 0), [2, 1, 8]);
+        // A task that took id 2 since, with a stamp of its own: not folded.
+        let mut other = sub_sample();
+        other.folded = load_folds(&folds_path(&path));
+        other.keep_folds_in_sight();
+        assert!(other.folded.is_empty());
+        assert_eq!(ids(&other, 0), [2, 5, 6, 7, 1, 8]);
+
+        // Unchanged, nothing written.
+        fs::remove_file(dir.join("board.json")).unwrap();
+        next.keep_folds(&path);
+        assert!(!dir.join("board.json").exists());
+
+        // Missing or unreadable: nothing folded, and no error.
+        for text in [None, Some("not json"), Some("{\"folded\":3}")] {
+            if let Some(text) = text {
+                fs::write(dir.join("board.json"), text).unwrap();
+            }
+            assert!(load_folds(&folds_path(&path)).is_empty(), "{text:?}");
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     // Shots for the design session: `HALIL_SHOTS=<dir> cargo test shots --
@@ -5078,6 +6411,258 @@ mod tests {
         press(&mut board, "ㅁ");
         press(&mut board, "장보기");
         shoot("hangul-80", "ㅁ (a), then 장보기 typed", &mut board, 80, 14);
+
+        // 0.4.0: tab lands on the row on the same line.
+        let mut board = mixed();
+        press(&mut board, "jjj");
+        shoot("lines-80", "Todo, line four picked", &mut board, 80, 18);
+        board.key(KeyEvent::from(KeyCode::Tab));
+        shoot(
+            "lines-80",
+            "tab: Doing is shorter, its last row",
+            &mut board,
+            80,
+            18,
+        );
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        press(&mut board, "k");
+        shoot(
+            "lines-80",
+            "back, then k: Todo's line one",
+            &mut board,
+            80,
+            18,
+        );
+        board.key(KeyEvent::from(KeyCode::Tab));
+        shoot("lines-80", "tab: Doing's line one", &mut board, 80, 18);
+        board.key(KeyEvent::from(KeyCode::BackTab));
+        press(&mut board, "jjj");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        board.key(KeyEvent::from(KeyCode::Tab));
+        shoot(
+            "lines-80",
+            "from line four, tab tab: Done's last row",
+            &mut board,
+            80,
+            18,
+        );
+
+        // 0.4.0: the calendar.
+        for w in [80, 60] {
+            let sheet = format!("calendar-{w}");
+            let mut board = mixed();
+            press(&mut board, "apay rent /");
+            shoot(&sheet, "a, `pay rent /` typed", &mut board, w, 20);
+            press(&mut board, "/");
+            shoot(
+                &sheet,
+                "the second /: open, today in the accent",
+                &mut board,
+                w,
+                20,
+            );
+            press(&mut board, "fri");
+            shoot(&sheet, "fri typed: the calendar follows", &mut board, w, 20);
+            press(&mut board, " 6pm");
+            board.key(KeyEvent::from(KeyCode::Right));
+            shoot(
+                &sheet,
+                "6pm typed, then →: the day written, the time kept",
+                &mut board,
+                w,
+                20,
+            );
+            board.key(KeyEvent::from(KeyCode::PageDown));
+            board.key(KeyEvent::from(KeyCode::PageDown));
+            shoot(
+                &sheet,
+                "pgdn twice: another year, with it",
+                &mut board,
+                w,
+                20,
+            );
+            board.key(KeyEvent::from(KeyCode::Esc));
+            shoot(&sheet, "esc: closed, the words left", &mut board, w, 20);
+
+            let mut board = mixed();
+            board.pick(8);
+            press(&mut board, "e //");
+            shoot(&sheet, "e on 8 (due nov 16), then //", &mut board, w, 20);
+            board.key(KeyEvent::from(KeyCode::Down));
+            shoot(&sheet, "↓: a week on from its date", &mut board, w, 20);
+
+            let mut board = mixed();
+            press(&mut board, "apay rent //");
+            shoot(&sheet, "9 rows: no room", &mut board, w, 9);
+        }
+
+        // 0.4.0: the picked row over its neighbours.
+        for w in [80, 60] {
+            let sheet = format!("overlay-{w}");
+            let mut board = sub_sample();
+            board.tasks[3] = task(4, "call mum", Status::Done, None, &[]);
+            shoot(
+                &sheet,
+                "pay rent over fix bike, cut where it ends",
+                &mut board,
+                w,
+                12,
+            );
+            let mut board = Board::new(
+                vec![
+                    task(
+                        1,
+                        "write the quarterly report",
+                        Status::Todo,
+                        None,
+                        &["work"],
+                    ),
+                    task(2, "분기 보고서 초안", Status::Doing, None, &[]),
+                    task(4, "call mum", Status::Done, None, &[]),
+                ],
+                today(),
+            );
+            shoot(&sheet, "Hangul under the overlay's end", &mut board, w, 12);
+            let mut board = Board::new(
+                vec![
+                    task(1, "buy milk", Status::Todo, None, &[]),
+                    due(
+                        task(
+                            2,
+                            "fix the bike before the weekend ride with the club and the long climb",
+                            Status::Doing,
+                            None,
+                            &["bike"],
+                        ),
+                        "2026-11-12",
+                    ),
+                    task(3, "call mum", Status::Done, None, &[]),
+                    task(5, "oil the chain", Status::Doing, None, &[]),
+                ],
+                today(),
+            );
+            go_to(&mut board, 1);
+            shoot(
+                &sheet,
+                "a wrapped row in Doing, over oil the chain",
+                &mut board,
+                w,
+                12,
+            );
+            let mut board = Board::new(
+                vec![
+                    task(1, "read the whole lease again", Status::Done, None, &[]),
+                    task(2, "call mum", Status::Done, None, &[]),
+                    task(3, "water plants", Status::Done, None, &[]),
+                    task(4, "buy milk", Status::Todo, None, &[]),
+                ],
+                today(),
+            );
+            go_to(&mut board, 2);
+            shoot(
+                &sheet,
+                "wrapped in Done: under itself, nothing pushed down",
+                &mut board,
+                w,
+                12,
+            );
+        }
+
+        // 0.4.0: folding.
+        for w in [80, 60] {
+            let sheet = format!("fold-{w}");
+            let mut board = mixed();
+            shoot(
+                &sheet,
+                "open, as ever: z fold in the footer",
+                &mut board,
+                w,
+                18,
+            );
+            press(&mut board, "z");
+            shoot(
+                &sheet,
+                "z: 1 folded, its date its open sub item's (nov 12)",
+                &mut board,
+                w,
+                18,
+            );
+            press(&mut board, "j");
+            shoot(&sheet, "j: past its sub items", &mut board, w, 18);
+            press(&mut board, "k");
+            press(&mut board, "z");
+            press(&mut board, "jj ");
+            press(&mut board, "k");
+            shoot(
+                &sheet,
+                "z again, open; 11 marked, picked: z fold on a sub item",
+                &mut board,
+                w,
+                18,
+            );
+            press(&mut board, "z");
+            shoot(
+                &sheet,
+                "z on a sub item: its card folds, its mark cleared",
+                &mut board,
+                w,
+                18,
+            );
+
+            let mut board = mixed();
+            board.tasks[11].due = Some("2026-11-09".parse().unwrap());
+            press(&mut board, "z");
+            shoot(
+                &sheet,
+                "a late sub item inside: the count red, the card its date",
+                &mut board,
+                w,
+                18,
+            );
+            press(&mut board, "j");
+            shoot(&sheet, "the same, not picked", &mut board, w, 18);
+            press(&mut board, "k");
+            board.tasks.push(sub(
+                task(14, "print the charts", Status::Todo, None, &[]),
+                1,
+            ));
+            shoot(
+                &sheet,
+                "another terminal's halil sub 1: the count, folded still",
+                &mut board,
+                w,
+                18,
+            );
+            go_to(&mut board, 2);
+            shoot(&sheet, "in Done: no z", &mut board, w, 18);
+
+            let mut board = mixed();
+            board.tasks.push(sub(
+                due(
+                    task(14, "book the photo", Status::Todo, None, &[]),
+                    "2026-11-12",
+                ),
+                5,
+            ));
+            board.pick(5);
+            shoot(
+                &sheet,
+                "5 (in 7 weeks) picked, its sub item due tomorrow",
+                &mut board,
+                w,
+                18,
+            );
+            press(&mut board, "z");
+            shoot(
+                &sheet,
+                "z: it moves up, and the row above says why",
+                &mut board,
+                w,
+                18,
+            );
+            press(&mut board, "z");
+            shoot(&sheet, "z again: back, and why", &mut board, w, 18);
+        }
 
         for (name, (p, a)) in sheets {
             fs::write(dir.join(format!("{name}.txt")), p).unwrap();

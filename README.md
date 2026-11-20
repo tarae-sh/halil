@@ -26,6 +26,7 @@ Or the latest from this repository: `cargo install --git https://github.com/tara
 ```sh
 halil add "pay rent friday 9am +home !high"
 halil add call mom today 6pm +family
+halil add plan the friday party //wed +home   # // marks the date
 halil                 # the open tasks, what's due first
 halil start 2         # to Doing
 halil done 2
@@ -41,6 +42,11 @@ no words are left):
 - **A due date.** A day (`today`, `tomorrow`, `friday` or `fri`, `next friday`, `in 3 days`, `in a week`,
   `nov 20`, `2026-11-20`), a time (`9am`, `9:30pm`, `14:30`, `noon`, `eod`), or both (`in 2 hours`). A time on
   its own means the next time it comes. `at`, `by`, `on` or `due` before a date goes with it.
+
+  Or marked with `//`, as `+` marks a tag: `//fri 6pm`, `//nov 27`. The words after it, up to the next `+tag`,
+  `!priority`, `-tag` or the end, must read as one date, or the task is refused (`` `//fridya` isn't a date``,
+  `` `//` needs a date``). With `//`, the other words are all title, date words too: `plan the friday party
+  //wed` is due Wednesday. Without it, date words are read wherever they are, as ever.
 - **Tags**, as `+home`. `edit` takes one off with `-home`, when the task has it. When it hasn't, `-home` among
   other words is a word of the title, and `-home` alone is refused (`3 has no tag home`).
 - **A priority**, as `!high`, `!med` or `!low`.
@@ -70,7 +76,7 @@ finishes by itself when its last sub item does.
 | `h` `l` | move it to the column left or right; a sub item moves with its card only |
 | `s` | move it to Doing; a sub item moves with its card only |
 | `t` | move it to Todo; a sub item moves with its card only |
-| `tab`, `←` `→` | go to another column |
+| `tab`, `←` `→` | go to another column, to the row on the same line, or its last row when it's shorter |
 | `a` | add a task, with the same words as `halil add` |
 | `A` | add a sub item under the picked card (or the picked sub item's card) |
 | `e` | change it, its title filled in, with the same words as `halil edit` |
@@ -78,6 +84,7 @@ finishes by itself when its last sub item does.
 | `x`, `Delete` | remove it, a card with its sub items, after asking |
 | `y`, `enter` | after `x`: remove; any other key keeps it |
 | `y` | copy its title to the clipboard |
+| `z` | fold the card's sub items away, or unfold them; on a sub item, its card's |
 | `esc` | clear the marks, or quit when there are none |
 | `q` | quit |
 
@@ -85,9 +92,26 @@ With marks, `h`, `l`, `s`, `t`, `d`, `e`, `x` and `y` act on all the marked at o
 then takes a date, `+tags`, `-tags` or a `!priority`, not a title; `y` copies each marked title, a line each, in
 the board's order.
 
-The picked row shows whole: when its title is cut or its tags or due date left out for room, it's shown on one
-line over the columns to its right, as far as the board's edge. Only a row longer than that wraps, there (in Done,
-under itself).
+The picked row shows whole: when its title is cut or its tags or due date left out for room, it's drawn over the
+columns to its right, on its own ground, covering just the cells it needs (its text and one more). The rest of the
+board is drawn as ever, and a neighbour's row is cut where the picked row ends; a double-width letter there, such
+as Hangul, is covered whole, never cut in half. Only a row longer than the room to the board's edge wraps (in
+Done, under itself), and its lines are drawn over the rows under it, which stay where they are.
+
+`z` folds a card: its sub items aren't drawn, `j` and `k` step past them, and the card's count shows it (`▸ 2/4`).
+`z` again, or `A` to add one, opens it. A folded card never hides what's due: the count turns red when an open sub
+item in it is late, and one due before the card's own date (or when the card has none) gives the card that date,
+which it sorts by. Folding clears the marks on its sub items, and says how many. The other keys act on the card,
+as ever; `x` still names its sub items. In Done, sub items are folded into the count already. The board keeps
+which cards are folded across runs, in a file of its own (see below); `halil`'s list shows sub items as ever.
+
+Where you type after `a`, `A` or `e`, the second `/` of a `//` opens a calendar above the line. Typing stays
+typing, and the calendar follows the date the words after `//` read as (on `e`, the task's own until then). `←`
+`→` move it a day, `↑` `↓` a week, `PageUp` `PageDown` a month, and each move writes the day after the `//` in
+words that read back as it (`nov 27`, or `2027-01-03` when it isn't this year), keeping a time you typed: a time
+is typed, not picked (`//fri 6pm`). While it's open, the arrows are the calendar's; `enter` saves, `esc` closes
+it and leaves the words, and a second `esc` leaves typing. Only another `//` opens it again. On a screen under 10
+rows, there's no calendar, and the row above the footer says to type the date.
 
 `y` copies with the platform's own command when there is one (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux,
 `clip.exe` under WSL), and else sends the title to the terminal's clipboard with its OSC 52 sequence; the row above
@@ -124,7 +148,8 @@ key); and the input method may hold a letter until the next key. The arrows, `sp
 ## Where tasks are kept
 
 `$XDG_DATA_HOME/halil/tasks.jsonl`, or `~/.local/share/halil/tasks.jsonl`: one JSON object a line, rewritten
-whole on each save (written beside it, then renamed over it). A sub item has `"parent": <id>`; one whose parent
+whole on each save (written beside it, then renamed over it). The board keeps the cards folded with `z` beside
+it, in `board.json`, by id and stamp; a missing or unreadable `board.json` means none are folded. A sub item has `"parent": <id>`; one whose parent
 is gone shows as a task of its own. Each task has a `"stamp"`, the time it was made, which never changes: ids are
 reused after a remove, so the stamp tells a task from one that took its id. A line written before 0.3.0 gets one
 when it's next saved.

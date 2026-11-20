@@ -31,7 +31,7 @@ enum Command {
     /// Add a task; its date, +tags and !priority are read from the words
     #[command(after_help = "Example: halil add \"pay rent friday 9am +home !high\"")]
     Add {
-        /// The task in plain English: a date, +tags, !high, !med or !low
+        /// The task in plain English: a date (or //fri 6pm), +tags, !high, !med or !low
         #[arg(required = true, trailing_var_arg = true)]
         words: Vec<String>,
     },
@@ -371,6 +371,72 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "3 has no tag money");
         assert_eq!(tasks, ship(), "the title untouched");
+    }
+
+    #[test]
+    fn add_edit_and_sub_take_a_marked_date_and_refuse_one_that_isnt() {
+        let mut tasks = ship();
+        let said = run(
+            Command::Add {
+                words: words("pay rent //fri 9am +home"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert_eq!(
+            said.text,
+            "Added 1: pay rent +home due Fri 2026-11-13 09:00\n"
+        );
+        let said = run(
+            Command::Sub {
+                id: 1,
+                words: words("transfer it //nov 12"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert!(
+            said.text
+                .starts_with("Added 2: transfer it due Thu 2026-11-12\n"),
+            "{}",
+            said.text
+        );
+        run(
+            Command::Edit {
+                id: 1,
+                words: words("//2027-01-03"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert_eq!(tasks[5].due.unwrap().to_string(), "2027-01-03");
+
+        let before = tasks.clone();
+        for (command, err) in [
+            (
+                Command::Add {
+                    words: words("pay rent //fridya"),
+                },
+                "`//fridya` isn't a date",
+            ),
+            (
+                Command::Sub {
+                    id: 1,
+                    words: words("x //"),
+                },
+                "`//` needs a date",
+            ),
+            (
+                Command::Edit {
+                    id: 1,
+                    words: words("// +home"),
+                },
+                "`//` needs a date",
+            ),
+        ] {
+            assert_eq!(run(command, &mut tasks), Err(err.into()));
+        }
+        assert_eq!(tasks, before, "nothing changed");
     }
 
     #[test]

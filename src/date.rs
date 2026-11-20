@@ -124,6 +124,31 @@ pub fn read<'a>(words: &[&'a str], now: DateTime) -> Result<(Option<Due>, Vec<&'
     Ok((due, rest))
 }
 
+/// A day, and a time on it if there's one, in words that [`read`] reads back
+/// as that day as of `today`: `nov 27` for a day this year from today on,
+/// else `2027-01-03`; then the time, `6pm` or `6:30pm`.
+pub fn say(date: Date, time: Option<Time>, today: Date) -> String {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let day = match date.year() == today.year() && date >= today {
+        true => format!("{} {}", MONTHS[date.month() as usize - 1], date.day()),
+        false => date.to_string(),
+    };
+    let Some(t) = time else {
+        return day;
+    };
+    let hour = match t.hour() % 12 {
+        0 => 12,
+        h => h,
+    };
+    let half = if t.hour() < 12 { "am" } else { "pm" };
+    match t.minute() {
+        0 => format!("{day} {hour}{half}"),
+        m => format!("{day} {hour}:{m:02}{half}"),
+    }
+}
+
 /// One date phrase: a day, a time, or both.
 enum Piece {
     Day(Date),
@@ -488,6 +513,30 @@ mod tests {
                 Ok(got) => panic!("{words:?}: read as {got:?}"),
                 Err(e) => assert!(e.contains(want), "{words:?}: {e}"),
             }
+        }
+    }
+
+    #[test]
+    fn said_days_read_back_as_the_same_day() {
+        let today = now().date();
+        let t = |h, m| Some(Time::new(h, m, 0, 0).unwrap());
+        for (d, time, want) in [
+            (date(2026, 11, 27), None, "nov 27"),
+            (date(2026, 11, 11), None, "nov 11"),
+            (date(2026, 11, 27), t(18, 0), "nov 27 6pm"),
+            (date(2026, 12, 31), t(0, 5), "dec 31 12:05am"),
+            (date(2026, 11, 13), t(12, 0), "nov 13 12pm"),
+            // Before today this year, or another year: with the year.
+            (date(2026, 11, 10), None, "2026-11-10"),
+            (date(2027, 1, 3), t(9, 30), "2027-01-03 9:30am"),
+            (date(2025, 12, 1), None, "2025-12-01"),
+        ] {
+            let said = say(d, time, today);
+            assert_eq!(said, want);
+            let words: Vec<&str> = said.split(' ').collect();
+            let (due, rest) = read(&words, now()).unwrap();
+            assert_eq!(due, Some(Due { date: d, time }), "{said}");
+            assert!(rest.is_empty());
         }
     }
 

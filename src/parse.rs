@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use jiff::civil::DateTime;
 
 use crate::date::{self, Due};
@@ -18,6 +20,11 @@ pub struct Parsed {
 /// The words may come as separate arguments or as one quoted string. Tags are
 /// lowercased and kept once each; the last priority wins. A lone `+` or `!`, or
 /// `!` not followed by a letter (`!!`), stays in the title.
+///
+/// `//` marks the date: the words after it, up to the next `+tag`, `!priority`,
+/// `-tag` or the end, must read as one (see [`mark_due`]), and then the other
+/// words are all title, date words or not. Without `//`, date words anywhere
+/// are read as ever.
 pub fn parse(words: &[String], now: DateTime) -> Result<Parsed, String> {
     let (parsed, _) = read(words, now, |_| false)?;
     if parsed.title.is_empty() {
@@ -122,8 +129,21 @@ fn read(
     let mut tags: Vec<String> = Vec::new();
     let mut untags: Vec<String> = Vec::new();
     let mut priority = None;
+    // Each `//`'s words, and whether the word read last was one of them.
+    let mut marks: Vec<Vec<&str>> = Vec::new();
+    let mut in_mark = false;
 
     for word in words.iter().flat_map(|w| w.split_whitespace()) {
+        if let Some(rest) = word.strip_prefix("//") {
+            marks.push(Vec::from_iter(Some(rest).filter(|r| !r.is_empty())));
+            in_mark = true;
+            continue;
+        }
+        if in_mark && !ends_mark(word) {
+            marks.last_mut().expect("a mark").push(word);
+            continue;
+        }
+        in_mark = false;
         if let Some(tag) = word.strip_prefix('+').filter(|t| !t.is_empty()) {
             let tag = tag.to_lowercase();
             if !tags.contains(&tag) {
@@ -147,7 +167,17 @@ fn read(
         }
     }
 
-    let (due, title) = date::read(&title, now)?;
+    let (due, title) = match &marks[..] {
+        [] => date::read(&title, now)?,
+        [words] => (Some(mark_due(words, now)?), title),
+        [first, second, ..] => {
+            return Err(format!(
+                "`//{}` and `//{}` both give the date: give one",
+                first.join(" "),
+                second.join(" ")
+            ));
+        }
+    };
     let parsed = Parsed {
         title: title.join(" "),
         tags,
@@ -155,6 +185,63 @@ fn read(
         due,
     };
     Ok((parsed, untags))
+}
+
+/// Whether `word` ends the words a `//` marks: a `+tag`, a `!priority`, a
+/// `-tag`, or another `//`. No date word starts as these do.
+fn ends_mark(word: &str) -> bool {
+    word.starts_with("//")
+        || word.strip_prefix('+').is_some_and(|t| !t.is_empty())
+        || word.strip_prefix('-').is_some_and(|t| !t.is_empty())
+        || word
+            .strip_prefix('!')
+            .is_some_and(|p| p.starts_with(char::is_alphabetic))
+}
+
+/// The date the words after a `//` give, read as of `now`: all of them must
+/// read as one date (`fri 6pm`, `nov 27`), else they're refused, quoted.
+pub fn mark_due(words: &[&str], now: DateTime) -> Result<Due, String> {
+    if words.is_empty() {
+        return Err("`//` needs a date".into());
+    }
+    match date::read(words, now) {
+        Ok((Some(due), rest)) if rest.is_empty() => Ok(due),
+        _ => Err(format!("`//{}` isn't a date", words.join(" "))),
+    }
+}
+
+/// The bytes of `text` that the `//` at byte `at` marks: its words, from
+/// right after it to the next mark or the end, without the spaces around
+/// them; an empty range right after it when there are none. A word glued to
+/// the `//` is always its own.
+pub fn marked(text: &str, at: usize) -> Range<usize> {
+    let from = at + 2;
+    let mut span = from..from;
+    let mut i = from;
+    loop {
+        let rest = &text[i..];
+        let start = i + (rest.len() - rest.trim_start().len());
+        let rest = &text[start..];
+        if rest.is_empty() {
+            break;
+        }
+        let len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if start != from && ends_mark(&rest[..len]) {
+            break;
+        }
+        if span.is_empty() {
+            span.start = start;
+        }
+        span.end = start + len;
+        i = span.end;
+    }
+    span
+}
+
+/// The date the `//` at byte `at` of `text` marks, if its words read as one.
+pub fn marked_due(text: &str, at: usize, now: DateTime) -> Option<Due> {
+    let words: Vec<&str> = text[marked(text, at)].split_whitespace().collect();
+    mark_due(&words, now).ok()
 }
 
 #[cfg(test)]
@@ -344,6 +431,97 @@ mod tests {
         // Beside other words, a -word is one of the title's, as before.
         edit(&mut task, "rent -work").unwrap();
         assert_eq!(task.title, "rent -work");
+    }
+
+    #[test]
+    fn slashes_mark_the_date_up_to_the_next_mark() {
+        let p = parse(&words("pay rent //fri 6pm +home !high")).unwrap();
+        assert_eq!(p.title, "pay rent");
+        assert_eq!(p.tags, ["home"]);
+        assert_eq!(p.priority, Some(Priority::High));
+        assert_eq!(p.due.unwrap().to_string(), "2026-11-13 18:00");
+        // A space after it, at the end, or before the title.
+        let p = parse(&words("pay rent // nov 27")).unwrap();
+        assert_eq!(p.due.unwrap().to_string(), "2026-11-27");
+        let p = parse(&words("//2027-01-03 +home pay rent")).unwrap();
+        assert_eq!(p.title, "pay rent");
+        assert_eq!(p.due.unwrap().to_string(), "2027-01-03");
+        // The words of a quoted string as of separate ones.
+        let p = parse(&["call mom //tomorrow 9am".to_string()]).unwrap();
+        assert_eq!(p.due.unwrap().to_string(), "2026-11-12 09:00");
+    }
+
+    #[test]
+    fn with_slashes_the_other_words_are_all_title() {
+        let p = parse(&words("plan the friday party //wed")).unwrap();
+        assert_eq!(p.title, "plan the friday party");
+        assert_eq!(p.due.unwrap().to_string(), "2026-11-11");
+        // Without them, date words read as ever.
+        let p = parse(&words("plan the party friday")).unwrap();
+        assert_eq!(p.title, "plan the party");
+        assert_eq!(p.due.unwrap().to_string(), "2026-11-13");
+        // A -word ends the date, and stays a word of the title in add.
+        let p = parse(&words("pay //fri -work")).unwrap();
+        assert_eq!(
+            (p.title.as_str(), p.due.unwrap().to_string()),
+            ("pay -work", "2026-11-13".into())
+        );
+    }
+
+    #[test]
+    fn slashes_that_dont_read_as_one_date_are_refused_quoted() {
+        for (s, err) in [
+            ("pay rent //fridya", "`//fridya` isn't a date"),
+            (
+                "pay rent //fri call him +home",
+                "`//fri call him` isn't a date",
+            ),
+            ("pay rent //feb 30", "`//feb 30` isn't a date"),
+            ("pay rent //fri sat", "`//fri sat` isn't a date"),
+            ("pay rent //", "`//` needs a date"),
+            ("pay rent // +home", "`//` needs a date"),
+            (
+                "pay //fri //sat",
+                "`//fri` and `//sat` both give the date: give one",
+            ),
+        ] {
+            assert_eq!(parse(&words(s)), Err(err.into()), "{s}");
+        }
+        let mut task = rent();
+        assert_eq!(
+            edit(&mut task, "//fridya"),
+            Err("`//fridya` isn't a date".into())
+        );
+        assert_eq!(task, rent());
+    }
+
+    #[test]
+    fn edit_takes_a_marked_date() {
+        let mut task = rent();
+        edit(&mut task, "//nov 27 6pm -home").unwrap();
+        assert_eq!(task.title, "pay rent");
+        assert!(task.tags.is_empty());
+        assert_eq!(task.due.unwrap().to_string(), "2026-11-27 18:00");
+    }
+
+    #[test]
+    fn the_marked_words_in_a_line_and_their_date() {
+        let now = date(2026, 11, 11).at(10, 30, 0, 0);
+        let line = "pay rent //fri 6pm +home";
+        let at = line.find("//").unwrap();
+        assert_eq!(&line[marked(line, at)], "fri 6pm");
+        assert_eq!(
+            marked_due(line, at, now).unwrap().to_string(),
+            "2026-11-13 18:00"
+        );
+        let line = "pay rent // nov 2";
+        assert_eq!(&line[marked(line, 9)], "nov 2");
+        for line in ["pay //", "pay // ", "pay // +home"] {
+            assert_eq!(marked(line, 4), 6..6, "{line:?}");
+            assert_eq!(marked_due(line, 4, now), None);
+        }
+        // Typing, it reads nothing until it reads.
+        assert_eq!(marked_due("x //fr", 2, now), None);
     }
 
     #[test]
