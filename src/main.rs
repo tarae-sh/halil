@@ -426,17 +426,147 @@ mod tests {
                 },
                 "`//` needs a date",
             ),
-            (
-                Command::Edit {
-                    id: 1,
-                    words: words("// +home"),
-                },
-                "`//` needs a date",
-            ),
         ] {
             assert_eq!(run(command, &mut tasks), Err(err.into()));
         }
         assert_eq!(tasks, before, "nothing changed");
+    }
+
+    fn dated(task: Task, due: &str) -> Task {
+        Task {
+            due: Some(due.parse().unwrap()),
+            ..task
+        }
+    }
+
+    /// The friday party (due Wednesday), a date with a time, no date, no date
+    /// with a date word in the title, a sub item, and Hangul.
+    fn dates() -> Vec<Task> {
+        vec![
+            dated(
+                task(1, "plan the friday party", Status::Todo, None),
+                "2026-11-11",
+            ),
+            dated(task(2, "pay rent", Status::Todo, None), "2026-11-13 18:00"),
+            task(3, "buy milk", Status::Doing, None),
+            task(4, "plan the friday party", Status::Todo, None),
+            dated(
+                task(5, "set up the transfer", Status::Todo, Some(2)),
+                "2026-11-20 09:00",
+            ),
+            dated(task(6, "월세 내기", Status::Todo, None), "2026-11-27"),
+        ]
+    }
+
+    #[test]
+    fn edit_reads_the_line_the_boards_e_fills_in_back_as_the_task() {
+        let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
+        let mut tasks = dates();
+        let mut lines = Vec::new();
+        for id in 1..=6 {
+            let (line, _) = parse::edit_line(&tasks[id as usize - 1], now);
+            lines.push(line.clone());
+            // As one quoted word, and as the shell splits it.
+            for words in [vec![line.clone()], words(&line)] {
+                run(Command::Edit { id, words }, &mut tasks).unwrap();
+                assert_eq!(tasks, dates(), "{line}");
+            }
+        }
+        assert_eq!(
+            lines,
+            [
+                "plan the friday party //2026-11-11",
+                "pay rent //2026-11-13 6pm",
+                "buy milk",
+                "plan the friday party //",
+                "set up the transfer //2026-11-20 9am",
+                "월세 내기 //2026-11-27",
+            ]
+        );
+
+        // 0.4.0's line, the title alone, lost the date word to the date.
+        run(
+            Command::Edit {
+                id: 1,
+                words: words("plan the friday party"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert_eq!(tasks[0].title, "plan the party");
+
+        // Changed in place: the title words stay title.
+        let mut tasks = dates();
+        let said = run(
+            Command::Edit {
+                id: 1,
+                words: words("plan the friday party //fri 6pm"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert_eq!(
+            said.text,
+            "Changed 1: plan the friday party due Fri 2026-11-13 18:00\n"
+        );
+        run(
+            Command::Edit {
+                id: 6,
+                words: words("월세 꼭 내기 //nov 30"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert_eq!(
+            (tasks[5].title.as_str(), tasks[5].due.unwrap().to_string()),
+            ("월세 꼭 내기", "2026-11-30".into())
+        );
+    }
+
+    #[test]
+    fn edit_takes_the_date_off_with_slashes_alone_add_and_sub_refuse_them() {
+        let mut tasks = dates();
+        for (id, line, said) in [
+            (2, "//", "Changed 2: pay rent\n"),
+            (
+                1,
+                "plan the friday party //",
+                "Changed 1: plan the friday party\n",
+            ),
+            (5, "// +bank", "Changed 5: set up the transfer +bank\n"),
+            (6, "월세 내기 //", "Changed 6: 월세 내기\n"),
+            // No date to take off: nothing else changes.
+            (3, "//", "Changed 3: buy milk\n"),
+        ] {
+            let got = run(
+                Command::Edit {
+                    id,
+                    words: words(line),
+                },
+                &mut tasks,
+            );
+            assert_eq!(got.unwrap().text, said, "{line}");
+        }
+        assert!(tasks.iter().all(|t| t.due.is_none()));
+        assert_eq!(tasks[4].parent, Some(2), "a sub item stays one");
+        let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+        let before: Vec<String> = dates().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, before);
+
+        // Not on add or sub: a new task has no date to take off.
+        let before = tasks.clone();
+        for command in [
+            Command::Add {
+                words: words("x //"),
+            },
+            Command::Sub {
+                id: 2,
+                words: words("x // +home"),
+            },
+        ] {
+            assert_eq!(run(command, &mut tasks), Err("`//` needs a date".into()));
+        }
+        assert_eq!(tasks, before);
     }
 
     #[test]

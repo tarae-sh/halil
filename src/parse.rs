@@ -24,9 +24,15 @@ pub struct Parsed {
 /// `//` marks the date: the words after it, up to the next `+tag`, `!priority`,
 /// `-tag` or the end, must read as one (see [`mark_due`]), and then the other
 /// words are all title, date words or not. Without `//`, date words anywhere
-/// are read as ever.
+/// are read as ever. A `//` with no words is refused here: only `edit` takes
+/// it, as the date taken off.
 pub fn parse(words: &[String], now: DateTime) -> Result<Parsed, String> {
-    let (parsed, _) = read(words, now, |_| false)?;
+    let Read {
+        parsed, undated, ..
+    } = read(words, now, |_| false)?;
+    if undated {
+        return Err(NEEDS_A_DATE.into());
+    }
     if parsed.title.is_empty() {
         return Err("a task needs a title, not just a date, tags and a priority".into());
     }
@@ -41,9 +47,10 @@ pub struct Change {
     /// Tags to add, and tags to take off.
     pub add: Vec<String>,
     pub remove: Vec<String>,
-    /// A priority or a date that replaces the task's own.
+    /// A priority that replaces the task's own.
     pub priority: Option<Priority>,
-    pub due: Option<Due>,
+    /// A date that replaces the task's own: `Some(None)` takes it off.
+    pub due: Option<Option<Due>>,
 }
 
 impl Change {
@@ -58,31 +65,64 @@ impl Change {
         }
         task.tags.retain(|t| !self.remove.contains(t));
         task.priority = self.priority.or(task.priority);
-        task.due = self.due.or(task.due);
+        if let Some(due) = self.due {
+            task.due = due;
+        }
     }
 }
 
 /// Reads the words of `edit` as `parse` reads them, and `-tag` too, which takes
 /// a tag off: it's read only when `has(tag)` says the task has it, else it
-/// stays in the title.
+/// stays in the title. A `//` with no words after it, up to the next mark or
+/// the end, takes the date off, and the other words are all title, as with
+/// any `//`.
 pub fn change(
     words: &[String],
     now: DateTime,
     has: impl Fn(&str) -> bool,
 ) -> Result<Change, String> {
-    let (p, remove) = read(words, now, has)?;
+    let Read {
+        parsed: p,
+        untags,
+        undated,
+    } = read(words, now, has)?;
     Ok(Change {
         title: Some(p.title).filter(|t| !t.is_empty()),
         add: p.tags,
-        remove,
+        remove: untags,
         priority: p.priority,
-        due: p.due,
+        due: match undated {
+            true => Some(None),
+            false => p.due.map(Some),
+        },
     })
+}
+
+/// The words `e` fills in on the board for `task`, which [`change`] reads
+/// back as it on any day, and the byte its title ends at: its title, then its
+/// date after `//` in words that name the day ([`date::say_exact`]:
+/// `2026-11-27 6pm`), never one relative to today, which a save after
+/// midnight would move. With no date, the title alone, or with `//` alone
+/// after it when its words would read as a date (`plan the friday party //`),
+/// so they stay title.
+pub fn edit_line(task: &Task, now: DateTime) -> (String, usize) {
+    let mark = match task.due {
+        Some(due) => format!(" //{}", date::say_exact(due)),
+        None => {
+            let words: Vec<&str> = task.title.split_whitespace().collect();
+            match date::read(&words, now) {
+                Ok((None, _)) => String::new(),
+                _ => " //".into(),
+            }
+        }
+    };
+    (format!("{}{mark}", task.title), task.title.len())
 }
 
 /// Changes `task` by the words of `edit` (see [`change`]): words left after the
 /// date, tags and priority replace its title, `+tags` are added to its own and
-/// `-tags` taken off, and a priority or a date replaces its own.
+/// `-tags` taken off, and a priority or a date replaces its own; `//` alone
+/// takes the date off.
 pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), String> {
     let change = change(words, now, |tag| task.tags.iter().any(|t| t == tag))?;
     if change == Change::default() {
@@ -119,12 +159,19 @@ pub fn refuse_missing_tags(id: u32, change: &Change) -> Result<(), String> {
     Err(format!("{id} has no tag {named}"))
 }
 
-/// `parse`'s reading, the title allowed empty, and the `-tags` that `has`.
-fn read(
-    words: &[String],
-    now: DateTime,
-    has: impl Fn(&str) -> bool,
-) -> Result<(Parsed, Vec<String>), String> {
+const NEEDS_A_DATE: &str = "`//` needs a date";
+
+/// What [`read`] reads.
+struct Read {
+    /// `parse`'s reading, the title allowed empty.
+    parsed: Parsed,
+    /// The `-tags` that `has`.
+    untags: Vec<String>,
+    /// A `//` with no words: the date taken off, on `edit`.
+    undated: bool,
+}
+
+fn read(words: &[String], now: DateTime, has: impl Fn(&str) -> bool) -> Result<Read, String> {
     let mut title = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     let mut untags: Vec<String> = Vec::new();
@@ -169,6 +216,7 @@ fn read(
 
     let (due, title) = match &marks[..] {
         [] => date::read(&title, now)?,
+        [words] if words.is_empty() => (None, title),
         [words] => (Some(mark_due(words, now)?), title),
         [first, second, ..] => {
             return Err(format!(
@@ -184,7 +232,11 @@ fn read(
         priority,
         due,
     };
-    Ok((parsed, untags))
+    Ok(Read {
+        parsed,
+        untags,
+        undated: matches!(&marks[..], [words] if words.is_empty()),
+    })
 }
 
 /// Whether `word` ends the words a `//` marks: a `+tag`, a `!priority`, a
@@ -199,11 +251,9 @@ fn ends_mark(word: &str) -> bool {
 }
 
 /// The date the words after a `//` give, read as of `now`: all of them must
-/// read as one date (`fri 6pm`, `nov 27`), else they're refused, quoted.
+/// read as one date (`fri 6pm`, `nov 27`), else they're refused, quoted. No
+/// words are none ([`read`] takes a `//` alone as the date taken off).
 pub fn mark_due(words: &[&str], now: DateTime) -> Result<Due, String> {
-    if words.is_empty() {
-        return Err("`//` needs a date".into());
-    }
     match date::read(words, now) {
         Ok((Some(due), rest)) if rest.is_empty() => Ok(due),
         _ => Err(format!("`//{}` isn't a date", words.join(" "))),
@@ -236,6 +286,21 @@ pub fn marked(text: &str, at: usize) -> Range<usize> {
         i = span.end;
     }
     span
+}
+
+/// The `//` whose words hold byte `cursor` of `text` — right after it, or in
+/// or at the end of its words — as the byte it's at.
+pub fn mark_holding(text: &str, cursor: usize) -> Option<usize> {
+    text.match_indices("//")
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace)
+        })
+        .filter(|&at| (at + 2..=marked(text, at).end).contains(&cursor))
+        .last()
 }
 
 /// The date the `//` at byte `at` of `text` marks, if its words read as one.
@@ -522,6 +587,108 @@ mod tests {
         }
         // Typing, it reads nothing until it reads.
         assert_eq!(marked_due("x //fr", 2, now), None);
+    }
+
+    #[test]
+    fn the_line_e_fills_in_is_the_title_then_the_date_and_reads_back_as_the_task() {
+        let now = date(2026, 11, 11).at(10, 30, 0, 0);
+        for (title, due, line) in [
+            (
+                "plan the friday party",
+                "2026-11-11",
+                "plan the friday party //2026-11-11",
+            ),
+            ("pay rent", "2026-11-13 18:00", "pay rent //2026-11-13 6pm"),
+            (
+                "pay rent",
+                "2026-11-13 18:30",
+                "pay rent //2026-11-13 6:30pm",
+            ),
+            (
+                "pay rent",
+                "2026-11-13 00:05",
+                "pay rent //2026-11-13 12:05am",
+            ),
+            // Late, or another year: the day named, as any other.
+            ("pay rent", "2026-11-09", "pay rent //2026-11-09"),
+            ("pay rent", "2027-01-03 09:00", "pay rent //2027-01-03 9am"),
+            ("buy milk", "", "buy milk"),
+            // No date, a date word in the title: `//` alone keeps it title.
+            ("plan the friday party", "", "plan the friday party //"),
+            ("fix the 9:60 clock", "", "fix the 9:60 clock //"),
+            ("월세 내기", "2026-11-27", "월세 내기 //2026-11-27"),
+            ("x -money", "2026-11-27", "x -money //2026-11-27"),
+        ] {
+            let task = Task {
+                title: title.into(),
+                due: (!due.is_empty()).then(|| due.parse().unwrap()),
+                ..rent()
+            };
+            assert_eq!(edit_line(&task, now), (line.into(), title.len()), "{title}");
+            let mut read = task.clone();
+            super::edit(&mut read, &[line.into()], now).unwrap();
+            assert_eq!(read, task, "{line}");
+        }
+    }
+
+    #[test]
+    fn slashes_alone_take_the_date_off_on_edit_only() {
+        let dated = || Task {
+            due: Some("2026-11-13 18:00".parse().unwrap()),
+            ..rent()
+        };
+        for (words, title, tags) in [
+            ("//", "pay rent", &["home"][..]),
+            ("// +car -home", "pay rent", &["car"]),
+            ("pay the rent //", "pay the rent", &["home"]),
+            ("pay rent friday // !low", "pay rent friday", &["home"]),
+        ] {
+            let mut task = dated();
+            edit(&mut task, words).unwrap();
+            assert_eq!(task.due, None, "{words}");
+            assert_eq!(task.title, title, "{words}");
+            assert_eq!(task.tags, tags, "{words}");
+        }
+        // In the change: taken off, which isn't left alone.
+        let now = date(2026, 11, 11).at(10, 30, 0, 0);
+        let off = change(&["//".into()], now, |_| false).unwrap();
+        assert_eq!(off.due, Some(None));
+        assert_eq!(change(&["x".into()], now, |_| false).unwrap().due, None);
+        // Two are refused still, empty or not.
+        let mut task = dated();
+        assert_eq!(
+            edit(&mut task, "//fri //"),
+            Err("`//fri` and `//` both give the date: give one".into())
+        );
+        assert_eq!(task, dated());
+        // add refuses them, quoted as ever.
+        assert_eq!(parse(&words("x //")), Err("`//` needs a date".into()));
+        assert_eq!(parse(&words("//")), Err("`//` needs a date".into()));
+    }
+
+    #[test]
+    fn the_slashes_whose_words_hold_the_cursor() {
+        let line = "pay rent //nov 13 6pm +home";
+        // `p`..` `: none; between the slashes: none; right after them, in
+        // their words and at their end: them; past the space after: none.
+        for (cursor, holding) in [
+            (0, None),
+            (8, None),
+            (9, None),
+            (10, None),
+            (11, Some(9)),
+            (14, Some(9)),
+            (21, Some(9)),
+            (22, None),
+            (line.len(), None),
+        ] {
+            assert_eq!(mark_holding(line, cursor), holding, "{cursor}");
+        }
+        assert_eq!(mark_holding("pay //", 6), Some(4));
+        assert_eq!(mark_holding("//fri", 5), Some(0));
+        // Slashes inside a word mark nothing, as `read` reads them.
+        assert_eq!(mark_holding("see a//b", 8), None);
+        assert_eq!(mark_holding("월세 //nov 2", "월세 //".len()), Some(7));
     }
 
     #[test]

@@ -950,8 +950,12 @@ impl Board {
                 if !self.marked.is_empty() {
                     self.input = Some(Input::new(InputKind::EditMarked, String::new()));
                 } else if let Some(i) = self.picked() {
-                    let kind = InputKind::Edit(self.held(i));
-                    self.input = Some(Input::new(kind, self.tasks[i].title.clone()));
+                    // Its title and its date, `//2026-11-27`, the cursor after the
+                    // title: typing goes on with it, as ever.
+                    let (line, title_end) = parse::edit_line(&self.tasks[i], self.now());
+                    let mut input = Input::new(InputKind::Edit(self.held(i)), line);
+                    input.cursor = title_end;
+                    self.input = Some(input);
                 }
             }
             _ => {}
@@ -1232,8 +1236,8 @@ impl Board {
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Char('c') if ctrl => self.input = None,
-            KeyCode::Char('a') if ctrl => input.cursor = 0,
-            KeyCode::Char('e') if ctrl => input.cursor = input.text.len(),
+            KeyCode::Char('a') if ctrl => input.move_to(0),
+            KeyCode::Char('e') if ctrl => input.move_to(input.text.len()),
             KeyCode::Char('u') if ctrl => {
                 input.text.replace_range(..input.cursor, "");
                 input.edited(0..input.cursor, 0);
@@ -1263,8 +1267,8 @@ impl Board {
                 input.edited(prev..input.cursor, 0);
                 input.cursor = prev;
             }
-            KeyCode::Left => input.cursor = input.prev(),
-            KeyCode::Right => input.cursor = input.next(),
+            KeyCode::Left => input.move_to(input.prev()),
+            KeyCode::Right => input.move_to(input.next()),
             KeyCode::Enter => {
                 input.cal = None;
                 let (kind, words) = (input.kind, [input.text.clone()]);
@@ -2406,9 +2410,10 @@ struct Input {
     cal: Option<Cal>,
 }
 
-/// The calendar a `//` typed in the input opens: where that `//` is, a byte
-/// index into the words. Its day is what the words after the `//` read as
-/// (see [`parse::marked_due`]), else the task's own on `e`.
+/// The calendar a `//` typed in the input opens, or the cursor moved into its
+/// words: where that `//` is, a byte index into the words. Its day is what
+/// the words after the `//` read as (see [`parse::marked_due`]), else the
+/// task's own on `e`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cal {
     at: usize,
@@ -2461,9 +2466,11 @@ impl Input {
         }
     }
 
-    /// Moves the calendar's day `by` and writes it after the `//`, in words
-    /// that read back as it, keeping the time: from the day the words read
-    /// as, else `own` (the task's on `e`), else `today`.
+    /// Moves the calendar's day `by` and writes it after the `//`, keeping
+    /// the time, in words that name the day (`2026-11-09 6pm`), as `e` fills
+    /// it in: they read back as it on any day, a day gone or a save past
+    /// midnight too. From the day the words read as, else `own` (the task's on
+    /// `e`), else `today`.
     fn move_day(&mut self, by: jiff::Span, own: Option<Due>, now: DateTime, today: Date) {
         let Some(cal) = self.cal else {
             return;
@@ -2472,10 +2479,26 @@ impl Input {
         let Ok(day) = from.map_or(today, |d| d.date).checked_add(by) else {
             return;
         };
-        let words = date::say(day, from.and_then(|d| d.time), today);
+        let words = date::say_exact(Due {
+            date: day,
+            time: from.and_then(|d| d.time),
+        });
         let span = parse::marked(&self.text, cal.at);
         self.text.replace_range(span.clone(), &words);
         self.cursor = span.start + words.len();
+    }
+
+    /// Moves the cursor to `to`. Moved into a `//`'s words, or right after it,
+    /// from outside them, it opens the calendar there, on the day they read
+    /// as: the date `e` filled in is reached as one typed.
+    fn move_to(&mut self, to: usize) {
+        let from = parse::mark_holding(&self.text, self.cursor);
+        self.cursor = to;
+        if let Some(at) = parse::mark_holding(&self.text, to)
+            && from != Some(at)
+        {
+            self.cal = Some(Cal { at });
+        }
     }
 
     /// Where the grapheme before the cursor starts.
@@ -2496,11 +2519,18 @@ impl Input {
 }
 
 /// What fits of `s` in `max` columns with the cursor, at byte `at`, in view,
-/// the cursor's column in it, and the byte of `s` it starts at.
+/// the cursor's column in it, and the byte of `s` it starts at: its end when
+/// the cursor is in it, so the words after the cursor show (the date `e`
+/// fills in after the title), else its start, else what ends at the cursor.
 fn view(s: &str, at: usize, max: usize) -> (String, usize, usize) {
     let before = &s[..at];
     if s.width() <= max {
         return (s.into(), before.width(), 0);
+    }
+    let end = tail(s, max);
+    let from = s.len() - end.len();
+    if from <= at {
+        return (end, s[from..at].width(), from);
     }
     if before.width() < max {
         return (head(s, max), before.width(), 0);
@@ -5608,14 +5638,14 @@ mod tests {
         let now = today().to_datetime(jiff::civil::Time::midnight());
         // The first move from today, the 11th; each written as halil reads it.
         for (code, want, day) in [
-            (KeyCode::Right, "pay //nov 12", "2026-11-12"),
-            (KeyCode::Left, "pay //nov 11", "2026-11-11"),
+            (KeyCode::Right, "pay //2026-11-12", "2026-11-12"),
+            (KeyCode::Left, "pay //2026-11-11", "2026-11-11"),
             (KeyCode::Left, "pay //2026-11-10", "2026-11-10"),
-            (KeyCode::Down, "pay //nov 17", "2026-11-17"),
+            (KeyCode::Down, "pay //2026-11-17", "2026-11-17"),
             (KeyCode::Up, "pay //2026-11-10", "2026-11-10"),
-            (KeyCode::PageDown, "pay //dec 10", "2026-12-10"),
+            (KeyCode::PageDown, "pay //2026-12-10", "2026-12-10"),
             (KeyCode::PageDown, "pay //2027-01-10", "2027-01-10"),
-            (KeyCode::PageUp, "pay //dec 10", "2026-12-10"),
+            (KeyCode::PageUp, "pay //2026-12-10", "2026-12-10"),
         ] {
             key(&mut board, code);
             assert_eq!(typed(&board), Some(want), "{code:?}");
@@ -5636,7 +5666,7 @@ mod tests {
         let mut board = sample();
         press(&mut board, "apay //fri 18:00 +home");
         key(&mut board, KeyCode::Right);
-        assert_eq!(typed(&board), Some("pay //nov 14 6pm +home"));
+        assert_eq!(typed(&board), Some("pay //2026-11-14 6pm +home"));
         // enter adds it, once.
         match key(&mut board, KeyCode::Enter) {
             Outcome::Change(Op::Add { task, .. }) => {
@@ -5646,6 +5676,67 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(board.input, None);
+    }
+
+    /// The calendar names the day it writes, so what's saved is the day it
+    /// showed: a day gone, one ahead this year, one next year, and today saved
+    /// a midnight later — on `a` from today, on `e` from the task's own day.
+    #[test]
+    fn a_calendar_move_saves_as_the_day_the_calendar_showed() {
+        let next_day = jiff::civil::date(2026, 11, 12);
+        use KeyCode::{Left, PageDown, Right};
+        let moves: [(&[KeyCode], &str); 4] = [
+            (&[Left, Left], "2026-11-09"),
+            (&[Right, Right, Right], "2026-11-14"),
+            (&[PageDown, PageDown], "2027-01-11"),
+            (&[Left, Right], "2026-11-11"),
+        ];
+        for (keys, day) in moves {
+            for enter_on in [today(), next_day] {
+                let mut board = sample();
+                press(&mut board, "apay //");
+                for &code in keys {
+                    key(&mut board, code);
+                }
+                let shown = cal_picked(&board.draw(80, 20).0);
+                assert_eq!(shown, [day[8..].trim_start_matches('0')], "{day}");
+                assert_eq!(typed(&board).unwrap(), format!("pay //{day}"));
+                board.today = enter_on;
+                assert!(enter(&mut board));
+                let added = board.tasks.last().unwrap();
+                assert_eq!(added.due.unwrap().to_string(), day, "saved on {enter_on}");
+            }
+        }
+
+        // On `e`, from the task's own day, Friday the 13th at 6pm.
+        let moves: [(&[KeyCode], &str, &str); 4] = [
+            (
+                &[Left, Left, Left, Left],
+                "2026-11-09 6pm",
+                "2026-11-09 18:00",
+            ),
+            (&[Right], "2026-11-14 6pm", "2026-11-14 18:00"),
+            (&[PageDown, PageDown], "2027-01-13 6pm", "2027-01-13 18:00"),
+            (&[Left, Left], "2026-11-11 6pm", "2026-11-11 18:00"),
+        ];
+        for (keys, words, due) in moves {
+            for enter_on in [today(), next_day] {
+                let mut board = one("pay rent", "2026-11-13 18:00");
+                press(&mut board, "e");
+                ctrl(&mut board, 'e');
+                for &code in keys {
+                    key(&mut board, code);
+                }
+                let shown = cal_picked(&board.draw(80, 20).0);
+                assert_eq!(shown, [due[8..10].trim_start_matches('0')], "{due}");
+                assert_eq!(typed(&board).unwrap(), format!("pay rent //{words}"));
+                board.today = enter_on;
+                assert!(enter(&mut board));
+                let rent = by_id(&board, 1);
+                assert_eq!(rent.due.unwrap().to_string(), due, "saved on {enter_on}");
+                assert_eq!(rent.title, "pay rent");
+            }
+        }
     }
 
     #[test]
@@ -5687,20 +5778,364 @@ mod tests {
         let mut board = sample();
         board.tasks[1].due = Some("2026-12-04 09:00".parse().unwrap());
         press(&mut board, "e");
-        assert_eq!(typed(&board), Some("pay rent"));
-        press(&mut board, " //");
+        assert_eq!(typed(&board), Some("pay rent //2026-12-04 9am"));
+        let cal = |board: &Board| board.input.as_ref().unwrap().cal;
+        assert_eq!(cal(&board), None, "the cursor after the title");
+        assert!(!text(&board.draw(80, 20).0[10]).contains("December"));
+        // The cursor moved into the date's words opens it there: right
+        // after the `//`, not before it.
+        key(&mut board, KeyCode::Right);
+        key(&mut board, KeyCode::Right);
+        assert_eq!(cal(&board), None);
+        key(&mut board, KeyCode::Right);
+        assert_eq!(cal(&board), Some(Cal { at: 9 }));
         let (lines, _) = board.draw(80, 20);
         assert!(text(&lines[10]).contains("December 2026"));
         assert_eq!(cal_picked(&lines), ["4"]);
         // The first move from it, its time with it, in the line to see.
         key(&mut board, KeyCode::Right);
-        assert_eq!(typed(&board), Some("pay rent //dec 5 9am"));
+        assert_eq!(typed(&board), Some("pay rent //2026-12-05 9am"));
+        // Closed, moving inside the words leaves it closed; from outside
+        // them, ctrl-e opens it again.
+        key(&mut board, KeyCode::Esc);
+        key(&mut board, KeyCode::Left);
+        key(&mut board, KeyCode::Right);
+        assert_eq!(cal(&board), None);
+        ctrl(&mut board, 'a');
+        assert_eq!(cal(&board), None);
+        ctrl(&mut board, 'e');
+        assert_eq!(cal(&board), Some(Cal { at: 9 }));
+        // Its words cleared: on the task's own day again, a move from it.
+        for _ in 0.."2026-12-05 9am".len() {
+            key(&mut board, KeyCode::Backspace);
+        }
+        assert_eq!(cal_picked(&board.draw(80, 20).0), ["4"]);
+        key(&mut board, KeyCode::Right);
+        assert_eq!(typed(&board), Some("pay rent //2026-12-05 9am"));
         assert!(enter(&mut board));
         assert_eq!(
             by_id(&board, 2).due.unwrap().to_string(),
             "2026-12-05 09:00"
         );
         assert_eq!(by_id(&board, 2).title, "pay rent");
+    }
+
+    // 0.4.1: `e` fills in the date.
+
+    /// A board of one task, 1, `title` +home, due `when` ("": no date).
+    fn one(title: &str, when: &str) -> Board {
+        let mut t = task(1, title, Status::Todo, None, &["home"]);
+        if !when.is_empty() {
+            t = due(t, when);
+        }
+        Board::new(vec![t], today())
+    }
+
+    /// The input's cursor, as cells after the footer's `  Edit 1  `.
+    fn cursor_cells(board: &mut Board) -> usize {
+        let (_, cursor) = board.draw(100, 12);
+        cursor.unwrap().0 as usize - "  Edit 1  ".len()
+    }
+
+    #[test]
+    fn e_fills_in_the_title_then_the_date_and_an_untouched_enter_changes_nothing() {
+        for (title, when, line) in [
+            (
+                "plan the friday party",
+                "2026-11-11",
+                "plan the friday party //2026-11-11",
+            ),
+            ("pay rent", "2026-11-13 18:00", "pay rent //2026-11-13 6pm"),
+            (
+                "pay rent",
+                "2026-11-09 09:30",
+                "pay rent //2026-11-09 9:30am",
+            ),
+            (
+                "renew the passport",
+                "2027-01-03",
+                "renew the passport //2027-01-03",
+            ),
+            ("buy milk", "", "buy milk"),
+            ("plan the friday party", "", "plan the friday party //"),
+            ("월세 내기", "2026-11-27", "월세 내기 //2026-11-27"),
+        ] {
+            let mut board = one(title, when);
+            press(&mut board, "e");
+            assert_eq!(typed(&board), Some(line));
+            assert_eq!(cursor_cells(&mut board), title.width(), "after {title:?}");
+            assert_eq!(key(&mut board, KeyCode::Enter), Outcome::Nothing, "{line}");
+            assert_eq!((&board.input, &board.message), (&None, &None));
+            assert_eq!(board.tasks, one(title, when).tasks, "{line}");
+        }
+
+        // A sub item, the same.
+        let mut board = sub_sample();
+        board.tasks[6].due = Some("2026-11-20 09:00".parse().unwrap());
+        let before = board.tasks.clone();
+        press(&mut board, "jje");
+        assert_eq!(typed(&board), Some("set up the transfer //2026-11-20 9am"));
+        assert_eq!(key(&mut board, KeyCode::Enter), Outcome::Nothing);
+        assert_eq!(board.tasks, before);
+        // Its date changed with the calendar, from the line.
+        press(&mut board, "e");
+        ctrl(&mut board, 'e');
+        key(&mut board, KeyCode::Down);
+        assert_eq!(typed(&board), Some("set up the transfer //2026-11-27 9am"));
+        assert!(enter(&mut board));
+        let six = by_id(&board, 6);
+        assert_eq!(six.due.unwrap().to_string(), "2026-11-27 09:00");
+        assert_eq!(
+            (six.title.as_str(), six.parent),
+            ("set up the transfer", Some(2))
+        );
+        assert_eq!(picked_id(&board), Some(6));
+    }
+
+    /// The property `e` is held to: for every task — with or without a date or
+    /// a time, late, due today or next year, a sub item, Hangul or date words
+    /// in its title — `e` then enter with nothing changed leaves it exactly as
+    /// it was, whatever day `e` is pressed on and whatever day enter is: the
+    /// same, a midnight later, or a week.
+    #[test]
+    fn e_then_an_untouched_enter_leaves_every_task_as_it_was_on_any_day() {
+        let titles = [
+            "pay rent",
+            "plan the friday party",
+            "call mum tomorrow 9am",
+            "월세 내기 금요일",
+            "x -money",
+        ];
+        let times = [
+            None,
+            Some((0, 0)),
+            Some((0, 5)),
+            Some((9, 30)),
+            Some((12, 0)),
+            Some((23, 59)),
+        ];
+        let offsets = [-400, -366, -31, -7, -1, 0, 1, 6, 7, 45, 364, 365, 400];
+        let after = |d: Date, n: i64| d.checked_add(jiff::Span::new().days(n)).unwrap();
+        let first = jiff::civil::date(2025, 12, 20);
+        let mut days: Vec<Date> = (0..=800).step_by(13).map(|n| after(first, n)).collect();
+        days.extend([
+            jiff::civil::date(2026, 12, 31),
+            jiff::civil::date(2027, 1, 1),
+            jiff::civil::date(2028, 2, 28),
+            jiff::civil::date(2028, 2, 29),
+            today(),
+        ]);
+        let card = task(1, "the card", Status::Todo, None, &[]);
+        let mut checked = 0;
+        for &on in &days {
+            let mut dues = vec![None];
+            for n in offsets {
+                for time in times {
+                    dues.push(Some(Due {
+                        date: after(on, n),
+                        time: time.map(|(h, m)| jiff::civil::Time::new(h, m, 0, 0).unwrap()),
+                    }));
+                }
+            }
+            for (n, (title, due)) in titles
+                .iter()
+                .flat_map(|t| dues.iter().map(move |d| (*t, *d)))
+                .enumerate()
+            {
+                let task = Task {
+                    due,
+                    parent: (n % 3 == 0).then_some(1),
+                    ..task(2, title, Status::Todo, Some(Priority::Med), &["money"])
+                };
+                for enter_on in [on, after(on, 1), after(on, 7)] {
+                    let tasks = vec![card.clone(), task.clone()];
+                    let mut board = Board::new(tasks.clone(), on);
+                    board.pick(2);
+                    assert_eq!(picked_id(&board), Some(2));
+                    press(&mut board, "e");
+                    let line = typed(&board).unwrap().to_string();
+                    board.today = enter_on;
+                    let outcome = key(&mut board, KeyCode::Enter);
+                    let why = format!("{task}: `{line}` filled in on {on}, enter on {enter_on}");
+                    assert_eq!(outcome, Outcome::Nothing, "{why}");
+                    assert_eq!((&board.message, &board.input), (&None, &None), "{why}");
+                    assert_eq!(board.tasks, tasks, "{why}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 70_000, "{checked}");
+    }
+
+    #[test]
+    fn a_long_titles_date_shows_in_the_typing_line_with_the_cursor_before_it() {
+        let title = "read the lease and mark what to ask the landlord";
+        for (w, when, date) in [
+            (80, "2026-11-16", " //2026-11-16"),
+            (60, "2026-11-16", " //2026-11-16"),
+            (80, "2027-01-03 09:30", " //2027-01-03 9:30am"),
+        ] {
+            let mut board = one(title, when);
+            press(&mut board, "e");
+            let (lines, cursor) = board.draw(w, 12);
+            let footer = text(&lines[11]);
+            let typed = footer.split("  ").nth(2).unwrap();
+            assert!(typed.ends_with(&format!("d{date}")), "{w}: {footer:?}");
+            let x = cursor.unwrap().0 as usize;
+            assert_eq!(
+                footer[x..].split("  ").next(),
+                Some(date),
+                "{w}: the cursor before it"
+            );
+            // Moved to the start, the start shows, as ever.
+            ctrl(&mut board, 'a');
+            let footer = text(&board.draw(w, 12).0[11]);
+            assert!(footer.starts_with("  Edit 1  read the lease"), "{footer:?}");
+            assert!(!footer.contains("//"));
+        }
+    }
+
+    #[test]
+    fn e_changes_the_date_in_place_and_typing_goes_on_with_the_title() {
+        // Typed after `e`: the title's, as in 0.4.0.
+        let mut board = one("pay rent", "2026-11-13 18:00");
+        press(&mut board, "e now");
+        assert_eq!(typed(&board), Some("pay rent now //2026-11-13 6pm"));
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, 1).title, "pay rent now");
+        assert_eq!(
+            by_id(&board, 1).due.unwrap().to_string(),
+            "2026-11-13 18:00"
+        );
+
+        // The time, typed over.
+        press(&mut board, "e");
+        ctrl(&mut board, 'e');
+        key(&mut board, KeyCode::Esc);
+        for _ in 0..3 {
+            key(&mut board, KeyCode::Backspace);
+        }
+        press(&mut board, "9am");
+        assert_eq!(typed(&board), Some("pay rent now //2026-11-13 9am"));
+        assert!(enter(&mut board));
+        let rent = by_id(&board, 1);
+        assert_eq!(rent.due.unwrap().to_string(), "2026-11-13 09:00");
+        assert_eq!(
+            (rent.title.as_str(), &rent.tags[..]),
+            ("pay rent now", &["home".to_string()][..])
+        );
+
+        // The friday party: a day typed in place, friday still title.
+        let mut board = one("plan the friday party", "2026-11-11");
+        press(&mut board, "e");
+        ctrl(&mut board, 'e');
+        for _ in 0.."2026-11-11".len() {
+            key(&mut board, KeyCode::Backspace);
+        }
+        press(&mut board, "fri");
+        assert!(enter(&mut board));
+        let party = by_id(&board, 1);
+        assert_eq!(party.title, "plan the friday party");
+        assert_eq!(party.due.unwrap().to_string(), "2026-11-13");
+
+        // No date: one typed after the title, as ever, or after the `//`
+        // that keeps a date word title.
+        let mut board = one("buy milk", "");
+        press(&mut board, "e //fri");
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, 1).due.unwrap().to_string(), "2026-11-13");
+        let mut board = one("plan the friday party", "");
+        press(&mut board, "e");
+        ctrl(&mut board, 'e');
+        press(&mut board, "sat");
+        assert!(enter(&mut board));
+        let party = by_id(&board, 1);
+        assert_eq!(party.title, "plan the friday party");
+        assert_eq!(party.due.unwrap().to_string(), "2026-11-14");
+
+        // Hangul: typed into the title, the date kept.
+        let mut board = one("월세 내기", "2026-11-27");
+        press(&mut board, "e");
+        ctrl(&mut board, 'a');
+        key(&mut board, KeyCode::Right);
+        key(&mut board, KeyCode::Right);
+        press(&mut board, " 꼭");
+        assert_eq!(typed(&board), Some("월세 꼭 내기 //2026-11-27"));
+        assert_eq!(cursor_cells(&mut board), "월세 꼭".width());
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, 1).title, "월세 꼭 내기");
+        assert_eq!(by_id(&board, 1).due.unwrap().to_string(), "2026-11-27");
+    }
+
+    #[test]
+    fn e_takes_the_date_off_when_the_words_after_the_slashes_are_cleared() {
+        for (title, when, next) in [
+            ("pay rent", "2026-11-13 18:00", "pay rent"),
+            (
+                "plan the friday party",
+                "2026-11-11",
+                "plan the friday party //",
+            ),
+            ("월세 내기", "2026-11-27", "월세 내기"),
+        ] {
+            let mut board = one(title, when);
+            press(&mut board, "e");
+            ctrl(&mut board, 'e');
+            let words = typed(&board).unwrap().split("//").nth(1).unwrap().len();
+            for _ in 0..words {
+                key(&mut board, KeyCode::Backspace);
+            }
+            assert_eq!(typed(&board).unwrap(), format!("{title} //"));
+            assert!(enter(&mut board), "{title}");
+            assert_eq!(board.message, None);
+            let task = by_id(&board, 1);
+            assert_eq!(task.due, None, "{title}");
+            assert_eq!(
+                (task.title.as_str(), &task.tags[..]),
+                (title, &["home".to_string()][..])
+            );
+            // And the next `e` has no date to fill in.
+            press(&mut board, "e");
+            assert_eq!(typed(&board), Some(next));
+            assert_eq!(key(&mut board, KeyCode::Enter), Outcome::Nothing);
+        }
+
+        // A sub item, the same.
+        let mut board = sub_sample();
+        board.tasks[6].due = Some("2026-11-20".parse().unwrap());
+        press(&mut board, "jje");
+        ctrl(&mut board, 'e');
+        ctrl(&mut board, 'u');
+        press(&mut board, "//");
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, 6).due, None);
+        assert_eq!(by_id(&board, 6).title, "set up the transfer");
+
+        // The whole `//2026-11-13 6pm` taken out: the date stays, as `halil
+        // edit` with no date leaves it.
+        let mut board = one("pay rent", "2026-11-13 18:00");
+        press(&mut board, "e");
+        ctrl(&mut board, 'e');
+        key(&mut board, KeyCode::Esc);
+        for _ in 0..2 {
+            ctrl(&mut board, 'w');
+        }
+        assert_eq!(typed(&board), Some("pay rent "));
+        assert_eq!(key(&mut board, KeyCode::Enter), Outcome::Nothing);
+        assert_eq!(board.tasks, one("pay rent", "2026-11-13 18:00").tasks);
+
+        // With marks, `//` takes them all off; `a` refuses it, as `add` does.
+        let mut board = marked_sample();
+        for i in [1, 2] {
+            board.tasks[i].due = Some("2026-11-20".parse().unwrap());
+        }
+        press(&mut board, "e//");
+        assert!(enter(&mut board));
+        assert_eq!((by_id(&board, 2).due, by_id(&board, 3).due), (None, None));
+        assert_eq!(by_id(&board, 2).title, "pay rent");
+        press(&mut board, "ax //");
+        assert!(!enter(&mut board));
+        assert_eq!(board.message.as_deref(), Some("`//` needs a date"));
     }
 
     #[test]
@@ -6484,10 +6919,26 @@ mod tests {
             board.key(KeyEvent::from(KeyCode::Esc));
             shoot(&sheet, "esc: closed, the words left", &mut board, w, 20);
 
+            // 0.4.1: `e` fills in the date; the cursor moved into it opens
+            // the calendar there.
             let mut board = mixed();
             board.pick(8);
-            press(&mut board, "e //");
-            shoot(&sheet, "e on 8 (due nov 16), then //", &mut board, w, 20);
+            press(&mut board, "e");
+            shoot(
+                &sheet,
+                "e on 8 (due nov 16): its title, then //2026-11-16",
+                &mut board,
+                w,
+                20,
+            );
+            ctrl(&mut board, 'e');
+            shoot(
+                &sheet,
+                "ctrl-e: the calendar on its date",
+                &mut board,
+                w,
+                20,
+            );
             board.key(KeyEvent::from(KeyCode::Down));
             shoot(&sheet, "↓: a week on from its date", &mut board, w, 20);
 
@@ -6495,6 +6946,33 @@ mod tests {
             press(&mut board, "apay rent //");
             shoot(&sheet, "9 rows: no room", &mut board, w, 9);
         }
+
+        // 0.4.1: the line `e` fills in, before and after.
+        let mut board = mixed();
+        board.tasks.push(due(
+            task(14, "plan the friday party", Status::Todo, None, &["home"]),
+            "2026-11-11 18:00",
+        ));
+        board.pick(14);
+        let i = board.picked().unwrap();
+        let kind = InputKind::Edit(board.held(i));
+        board.input = Some(Input::new(kind, board.tasks[i].title.clone()));
+        shoot(
+            "edit-80",
+            "before, 0.4.0: e on 14 (due today 6pm) fills in the title alone; enter makes it `plan the party`, due fri",
+            &mut board,
+            80,
+            14,
+        );
+        board.input = None;
+        press(&mut board, "e");
+        shoot(
+            "edit-80",
+            "after, 0.4.1: the title, then //2026-11-11 6pm; enter untouched changes nothing",
+            &mut board,
+            80,
+            14,
+        );
 
         // 0.4.0: the picked row over its neighbours.
         for w in [80, 60] {

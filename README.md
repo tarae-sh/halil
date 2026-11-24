@@ -31,22 +31,26 @@ halil                 # the open tasks, what's due first
 halil start 2         # to Doing
 halil done 2
 halil edit 1 next monday !med   # a new date and priority, the title kept
+halil edit 1 //                 # the date taken off
 halil sub 1 transfer it friday  # a sub item under task 1
 halil rm 1
 halil board
 ```
 
 `add` and `edit` read three things out of the words, and the rest is the title (`edit` keeps the old title when
-no words are left):
+no words are left, and the old date when none is given):
 
 - **A due date.** A day (`today`, `tomorrow`, `friday` or `fri`, `next friday`, `in 3 days`, `in a week`,
   `nov 20`, `2026-11-20`), a time (`9am`, `9:30pm`, `14:30`, `noon`, `eod`), or both (`in 2 hours`). A time on
   its own means the next time it comes. `at`, `by`, `on` or `due` before a date goes with it.
 
   Or marked with `//`, as `+` marks a tag: `//fri 6pm`, `//nov 27`. The words after it, up to the next `+tag`,
-  `!priority`, `-tag` or the end, must read as one date, or the task is refused (`` `//fridya` isn't a date``,
-  `` `//` needs a date``). With `//`, the other words are all title, date words too: `plan the friday party
-  //wed` is due Wednesday. Without it, date words are read wherever they are, as ever.
+  `!priority`, `-tag` or the end, must read as one date, or the task is refused (`` `//fridya` isn't a date``).
+  With `//`, the other words are all title, date words too: `plan the friday party //wed` is due Wednesday.
+  Without it, date words are read wherever they are, as ever.
+
+  `//` with nothing after it takes the date off, in `edit` only: `halil edit 3 //`, or `halil edit 3 plan the
+  friday party //` with the title kept whole. `add` and `sub` refuse it (`` `//` needs a date``).
 - **Tags**, as `+home`. `edit` takes one off with `-home`, when the task has it. When it hasn't, `-home` among
   other words is a word of the title, and `-home` alone is refused (`3 has no tag home`).
 - **A priority**, as `!high`, `!med` or `!low`.
@@ -79,7 +83,7 @@ finishes by itself when its last sub item does.
 | `tab`, `←` `→` | go to another column, to the row on the same line, or its last row when it's shorter |
 | `a` | add a task, with the same words as `halil add` |
 | `A` | add a sub item under the picked card (or the picked sub item's card) |
-| `e` | change it, its title filled in, with the same words as `halil edit` |
+| `e` | change it, its title and date filled in (`pay rent //2026-11-27 6pm`), with the same words as `halil edit` |
 | `d` | move it to Done, its open sub items with it; on a sub item, done or open again |
 | `x`, `Delete` | remove it, a card with its sub items, after asking |
 | `y`, `enter` | after `x`: remove; any other key keeps it |
@@ -88,9 +92,17 @@ finishes by itself when its last sub item does.
 | `esc` | clear the marks, or quit when there are none |
 | `q` | quit |
 
+`e` fills in the title, then the date after `//`, its day named and its time as you'd type it (`pay rent
+//2026-11-27 6pm`), so it reads back as the same day whenever you save, past midnight too. The cursor starts after
+the title, so typing goes on with the title. `enter` with the line untouched changes nothing, and a date word in
+the title stays title, as with any `//`. Change the
+date in place, or clear the words after the `//`, keeping it, to take the date off, as `halil edit 3 //` does;
+taking the `//` out too leaves the date as it is, as `halil edit` with no date does. A task with no date shows its
+title alone, or `plan the friday party //` when a word of the title would read as a date.
+
 With marks, `h`, `l`, `s`, `t`, `d`, `e`, `x` and `y` act on all the marked at once, and `esc` clears them. `e`
-then takes a date, `+tags`, `-tags` or a `!priority`, not a title; `y` copies each marked title, a line each, in
-the board's order.
+then takes a date, `//` alone to take their dates off, `+tags`, `-tags` or a `!priority`, not a title; `y` copies
+each marked title, a line each, in the board's order.
 
 The picked row shows whole: when its title is cut or its tags or due date left out for room, it's drawn over the
 columns to its right, on its own ground, covering just the cells it needs (its text and one more). The rest of the
@@ -105,12 +117,14 @@ which it sorts by. Folding clears the marks on its sub items, and says how many.
 as ever; `x` still names its sub items. In Done, sub items are folded into the count already. The board keeps
 which cards are folded across runs, in a file of its own (see below); `halil`'s list shows sub items as ever.
 
-Where you type after `a`, `A` or `e`, the second `/` of a `//` opens a calendar above the line. Typing stays
-typing, and the calendar follows the date the words after `//` read as (on `e`, the task's own until then). `←`
-`→` move it a day, `↑` `↓` a week, `PageUp` `PageDown` a month, and each move writes the day after the `//` in
-words that read back as it (`nov 27`, or `2027-01-03` when it isn't this year), keeping a time you typed: a time
-is typed, not picked (`//fri 6pm`). While it's open, the arrows are the calendar's; `enter` saves, `esc` closes
-it and leaves the words, and a second `esc` leaves typing. Only another `//` opens it again. On a screen under 10
+Where you type after `a`, `A` or `e`, the second `/` of a `//` opens a calendar above the line, and so does the
+cursor moved into a `//`'s words from outside them (`ctrl-e` after `e`, or `→`). Typing stays typing, and the
+calendar follows the date the words after `//` read as (on `e`, the task's own while they read as none). `←`
+`→` move it a day, `↑` `↓` a week, `PageUp` `PageDown` a month, and each move writes the day after the `//`,
+named as `e` fills it in (`2026-11-27`, `2026-11-27 6pm`), so it's saved as the day the calendar showed: a day
+already gone, or saved past midnight, too. A time you typed is kept: a time is typed, not picked (`//fri 6pm`). While it's open, the arrows are the calendar's; `enter` saves, `esc` closes
+it and leaves the words, and a second `esc` leaves typing. Another `//`, or the cursor moved out of the words and
+back in, opens it again. On a screen under 10
 rows, there's no calendar, and the row above the footer says to type the date.
 
 `y` copies with the platform's own command when there is one (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux,

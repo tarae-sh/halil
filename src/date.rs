@@ -124,28 +124,26 @@ pub fn read<'a>(words: &[&'a str], now: DateTime) -> Result<(Option<Due>, Vec<&'
     Ok((due, rest))
 }
 
-/// A day, and a time on it if there's one, in words that [`read`] reads back
-/// as that day as of `today`: `nov 27` for a day this year from today on,
-/// else `2027-01-03`; then the time, `6pm` or `6:30pm`.
-pub fn say(date: Date, time: Option<Time>, today: Date) -> String {
-    const MONTHS: [&str; 12] = [
-        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-    ];
-    let day = match date.year() == today.year() && date >= today {
-        true => format!("{} {}", MONTHS[date.month() as usize - 1], date.day()),
-        false => date.to_string(),
-    };
-    let Some(t) = time else {
-        return day;
-    };
+/// `due` in words that name its day, which [`read`] reads back as it on any
+/// day: `2026-11-27`, then the time as it's typed, `2026-11-27 6pm`. Never a
+/// month and a day (`nov 27`): read after that day, they're next year's.
+pub fn say_exact(due: Due) -> String {
+    match due.time {
+        None => due.date.to_string(),
+        Some(t) => format!("{} {}", due.date, say_time(t)),
+    }
+}
+
+/// A time as it's typed: `6pm`, `6:30pm`, `12am`.
+fn say_time(t: Time) -> String {
     let hour = match t.hour() % 12 {
         0 => 12,
         h => h,
     };
     let half = if t.hour() < 12 { "am" } else { "pm" };
     match t.minute() {
-        0 => format!("{day} {hour}{half}"),
-        m => format!("{day} {hour}:{m:02}{half}"),
+        0 => format!("{hour}{half}"),
+        m => format!("{hour}:{m:02}{half}"),
     }
 }
 
@@ -517,26 +515,31 @@ mod tests {
     }
 
     #[test]
-    fn said_days_read_back_as_the_same_day() {
-        let today = now().date();
+    fn exact_words_read_back_as_the_same_day_on_any_day() {
         let t = |h, m| Some(Time::new(h, m, 0, 0).unwrap());
         for (d, time, want) in [
-            (date(2026, 11, 27), None, "nov 27"),
-            (date(2026, 11, 11), None, "nov 11"),
-            (date(2026, 11, 27), t(18, 0), "nov 27 6pm"),
-            (date(2026, 12, 31), t(0, 5), "dec 31 12:05am"),
-            (date(2026, 11, 13), t(12, 0), "nov 13 12pm"),
-            // Before today this year, or another year: with the year.
-            (date(2026, 11, 10), None, "2026-11-10"),
+            (date(2026, 11, 25), None, "2026-11-25"),
+            (date(2026, 11, 25), t(18, 0), "2026-11-25 6pm"),
+            (date(2026, 11, 25), t(0, 5), "2026-11-25 12:05am"),
+            (date(2026, 11, 13), t(12, 0), "2026-11-13 12pm"),
+            (date(2028, 2, 29), t(12, 30), "2028-02-29 12:30pm"),
             (date(2027, 1, 3), t(9, 30), "2027-01-03 9:30am"),
             (date(2025, 12, 1), None, "2025-12-01"),
         ] {
-            let said = say(d, time, today);
+            let due = Due { date: d, time };
+            let said = say_exact(due);
             assert_eq!(said, want);
             let words: Vec<&str> = said.split(' ').collect();
-            let (due, rest) = read(&words, now()).unwrap();
-            assert_eq!(due, Some(Due { date: d, time }), "{said}");
-            assert!(rest.is_empty());
+            // Read the day before, on it, after it, and a year on.
+            for on in [
+                date(2026, 11, 24),
+                d,
+                date(2026, 11, 26),
+                date(2027, 11, 25),
+            ] {
+                let (read, rest) = read(&words, on.at(23, 59, 0, 0)).unwrap();
+                assert_eq!((read, rest.len()), (Some(due), 0), "{said} on {on}");
+            }
         }
     }
 
