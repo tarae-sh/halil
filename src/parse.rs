@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use jiff::civil::DateTime;
 
-use crate::date::{self, Due};
+use crate::date::{self, Due, Every};
 use crate::task::{Priority, Task};
 
 /// What `add` reads out of its words.
@@ -12,6 +12,8 @@ pub struct Parsed {
     pub tags: Vec<String>,
     pub priority: Option<Priority>,
     pub due: Option<Due>,
+    /// How it repeats: `every …` inside the `//` mark.
+    pub every: Option<Every>,
 }
 
 /// Splits the words of `add` into the title, `+tags`, a `!priority` and a due
@@ -29,7 +31,7 @@ pub struct Parsed {
 pub fn parse(words: &[String], now: DateTime) -> Result<Parsed, String> {
     let Read {
         parsed, undated, ..
-    } = read(words, now, |_| false)?;
+    } = read(words, now, |_| false, false)?;
     if undated {
         return Err(NEEDS_A_DATE.into());
     }
@@ -51,6 +53,9 @@ pub struct Change {
     pub priority: Option<Priority>,
     /// A date that replaces the task's own: `Some(None)` takes it off.
     pub due: Option<Option<Due>>,
+    /// A repeat that replaces the task's own: `Some(None)` stops it (`-every`,
+    /// or `//` alone, the date taken off).
+    pub every: Option<Option<Every>>,
 }
 
 impl Change {
@@ -66,7 +71,17 @@ impl Change {
         task.tags.retain(|t| !self.remove.contains(t));
         task.priority = self.priority.or(task.priority);
         if let Some(due) = self.due {
+            // A date moved alone keeps the step, a month or year step aimed
+            // at its day now.
+            if self.every.is_none()
+                && let (Some(due), Some(every)) = (due, task.every.as_mut())
+            {
+                *every = every.aimed_at(due.date);
+            }
             task.due = due;
+        }
+        if let Some(every) = self.every {
+            task.every = every;
         }
     }
 }
@@ -75,17 +90,21 @@ impl Change {
 /// a tag off: it's read only when `has(tag)` says the task has it, else it
 /// stays in the title. A `//` with no words after it, up to the next mark or
 /// the end, takes the date off, and the other words are all title, as with
-/// any `//`.
+/// any `//`. When the task `repeats`, `-every` stops it; a `//` mark with
+/// `every …` in it gives a new one, and one without leaves the task's as it
+/// is; `//` alone takes the step off with the date.
 pub fn change(
     words: &[String],
     now: DateTime,
     has: impl Fn(&str) -> bool,
+    repeats: bool,
 ) -> Result<Change, String> {
     let Read {
         parsed: p,
         untags,
         undated,
-    } = read(words, now, has)?;
+        stop_every,
+    } = read(words, now, has, repeats)?;
     Ok(Change {
         title: Some(p.title).filter(|t| !t.is_empty()),
         add: p.tags,
@@ -94,6 +113,11 @@ pub fn change(
         due: match undated {
             true => Some(None),
             false => p.due.map(Some),
+        },
+        every: match (p.every, undated || stop_every) {
+            (Some(every), _) => Some(Some(every)),
+            (None, true) => Some(None),
+            (None, false) => None,
         },
     })
 }
@@ -107,7 +131,10 @@ pub fn change(
 /// so they stay title.
 pub fn edit_line(task: &Task, now: DateTime) -> (String, usize) {
     let mark = match task.due {
-        Some(due) => format!(" //{}", date::say_exact(due)),
+        Some(due) => match task.every {
+            Some(every) => format!(" //{} {}", date::say_exact(due), every.words(due.date)),
+            None => format!(" //{}", date::say_exact(due)),
+        },
         None => {
             let words: Vec<&str> = task.title.split_whitespace().collect();
             match date::read(&words, now) {
@@ -123,8 +150,13 @@ pub fn edit_line(task: &Task, now: DateTime) -> (String, usize) {
 /// date, tags and priority replace its title, `+tags` are added to its own and
 /// `-tags` taken off, and a priority or a date replaces its own; `//` alone
 /// takes the date off.
-pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), String> {
-    let change = change(words, now, |tag| task.tags.iter().any(|t| t == tag))?;
+pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<Change, String> {
+    let change = change(
+        words,
+        now,
+        |tag| task.tags.iter().any(|t| t == tag),
+        task.every.is_some(),
+    )?;
     if change == Change::default() {
         return Err(
             "nothing to change: give a new title, a date, +tags, -tags or a !priority".into(),
@@ -132,7 +164,7 @@ pub fn edit(task: &mut Task, words: &[String], now: DateTime) -> Result<(), Stri
     }
     refuse_missing_tags(task.id, &change)?;
     change.apply(task);
-    Ok(())
+    Ok(change)
 }
 
 /// Refuses `change` to task `id` when every word left for the title is a
@@ -152,6 +184,7 @@ pub fn refuse_missing_tags(id: u32, change: &Change) -> Result<(), String> {
         }
     }
     let named = match tags.split_last() {
+        Some((last, [])) if last == "every" => return Err(format!("{id} doesn't repeat")),
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
         None => return Ok(()),
@@ -169,9 +202,17 @@ struct Read {
     untags: Vec<String>,
     /// A `//` with no words: the date taken off, on `edit`.
     undated: bool,
+    /// `-every`, on a task that repeats.
+    stop_every: bool,
 }
 
-fn read(words: &[String], now: DateTime, has: impl Fn(&str) -> bool) -> Result<Read, String> {
+fn read(
+    words: &[String],
+    now: DateTime,
+    has: impl Fn(&str) -> bool,
+    repeats: bool,
+) -> Result<Read, String> {
+    let mut stop_every = false;
     let mut title = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     let mut untags: Vec<String> = Vec::new();
@@ -196,6 +237,8 @@ fn read(words: &[String], now: DateTime, has: impl Fn(&str) -> bool) -> Result<R
             if !tags.contains(&tag) {
                 tags.push(tag);
             }
+        } else if repeats && word.eq_ignore_ascii_case("-every") {
+            stop_every = true;
         } else if let Some(tag) = word
             .strip_prefix('-')
             .map(str::to_lowercase)
@@ -214,10 +257,16 @@ fn read(words: &[String], now: DateTime, has: impl Fn(&str) -> bool) -> Result<R
         }
     }
 
-    let (due, title) = match &marks[..] {
-        [] => date::read(&title, now)?,
-        [words] if words.is_empty() => (None, title),
-        [words] => (Some(mark_due(words, now)?), title),
+    let (due, title, every) = match &marks[..] {
+        [] => {
+            let (due, title) = date::read(&title, now)?;
+            (due, title, None)
+        }
+        [words] if words.is_empty() => (None, title, None),
+        [words] => {
+            let (due, every) = mark_due(words, now)?;
+            (Some(due), title, every)
+        }
         [first, second, ..] => {
             return Err(format!(
                 "`//{}` and `//{}` both give the date: give one",
@@ -231,11 +280,13 @@ fn read(words: &[String], now: DateTime, has: impl Fn(&str) -> bool) -> Result<R
         tags,
         priority,
         due,
+        every,
     };
     Ok(Read {
         parsed,
         untags,
         undated: matches!(&marks[..], [words] if words.is_empty()),
+        stop_every,
     })
 }
 
@@ -250,14 +301,47 @@ fn ends_mark(word: &str) -> bool {
             .is_some_and(|p| p.starts_with(char::is_alphabetic))
 }
 
-/// The date the words after a `//` give, read as of `now`: all of them must
-/// read as one date (`fri 6pm`, `nov 27`), else they're refused, quoted. No
-/// words are none ([`read`] takes a `//` alone as the date taken off).
-pub fn mark_due(words: &[&str], now: DateTime) -> Result<Due, String> {
-    match date::read(words, now) {
-        Ok((Some(due), rest)) if rest.is_empty() => Ok(due),
-        _ => Err(format!("`//{}` isn't a date", words.join(" "))),
-    }
+/// Whether `word` starts the step in a `//` mark: `every`, `daily`, `weekly`,
+/// `monthly`, `yearly`.
+fn starts_step(word: &str) -> bool {
+    matches!(
+        word.to_lowercase().as_str(),
+        "every" | "daily" | "weekly" | "monthly" | "yearly"
+    )
+}
+
+/// The date the words after a `//` give, read as of `now`, and how it
+/// repeats: `fri 6pm`, `nov 27`, `dec 1 every 2 weeks`, `every fri`. The words
+/// before a step must read as one date, and the step's as one step (see
+/// [`date::read_step`]), else they're refused, quoted, never taken into the
+/// title. With a step and no date, the first is the step's next match from
+/// today, today included. No words are none ([`read`] takes a `//` alone as
+/// the date taken off).
+pub fn mark_due(words: &[&str], now: DateTime) -> Result<(Due, Option<Every>), String> {
+    let bad = || format!("`//{}` isn't a date", words.join(" "));
+    let at = words.iter().position(|w| starts_step(w));
+    let (date_words, step) = match at {
+        Some(i) => {
+            let lower: Vec<String> = words[i..].iter().map(|w| w.to_lowercase()).collect();
+            let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
+            (&words[..i], Some(date::read_step(&lower).ok_or_else(bad)?))
+        }
+        None => (words, None),
+    };
+    let due = match (date_words, &step) {
+        ([], Some(step)) => step.first(now.date()),
+        _ => match date::read(date_words, now) {
+            Ok((Some(due), rest)) if rest.is_empty() => due,
+            _ => return Err(bad()),
+        },
+    };
+    Ok(match step {
+        Some(step) => {
+            let (due, every) = step.with_first(due);
+            (due, Some(every))
+        }
+        None => (due, None),
+    })
 }
 
 /// The bytes of `text` that the `//` at byte `at` marks: its words, from
@@ -306,7 +390,45 @@ pub fn mark_holding(text: &str, cursor: usize) -> Option<usize> {
 /// The date the `//` at byte `at` of `text` marks, if its words read as one.
 pub fn marked_due(text: &str, at: usize, now: DateTime) -> Option<Due> {
     let words: Vec<&str> = text[marked(text, at)].split_whitespace().collect();
-    mark_due(&words, now).ok()
+    mark_due(&words, now).ok().map(|(due, _)| due)
+}
+
+/// The bytes of the weekday in the step the `//` at byte `at` marks, when
+/// the step is `every <weekday>` (`every fri`): a move in the calendar
+/// rewrites it to the picked day's.
+pub fn marked_step_weekday(text: &str, at: usize) -> Option<Range<usize>> {
+    let (date, span) = (marked_date(text, at), marked(text, at));
+    let step = &text[date.end..span.end];
+    let words: Vec<(usize, &str)> = step
+        .split_whitespace()
+        .map(|w| (w.as_ptr() as usize - step.as_ptr() as usize, w))
+        .collect();
+    match words[..] {
+        [(_, every), (i, weekday)]
+            if every.eq_ignore_ascii_case("every") && date::is_weekday(weekday) =>
+        {
+            Some(date.end + i..date.end + i + weekday.len())
+        }
+        _ => None,
+    }
+}
+
+/// The bytes of the date's own words that the `//` at byte `at` marks: its
+/// words up to a step (`every …`), which the calendar leaves as typed; an
+/// empty range where the step starts when there's no date before it.
+pub fn marked_date(text: &str, at: usize) -> Range<usize> {
+    let span = marked(text, at);
+    let mut end = span.start;
+    let mut i = span.start;
+    for word in text[span.clone()].split_whitespace() {
+        let start = i + text[i..].find(word).unwrap_or(0);
+        if starts_step(word) {
+            return span.start..end;
+        }
+        end = start + word.len();
+        i = end;
+    }
+    span
 }
 
 #[cfg(test)]
@@ -334,6 +456,7 @@ mod tests {
                 tags: vec!["home".into()],
                 priority: Some(Priority::High),
                 due: None,
+                every: None,
             }
         );
     }
@@ -434,12 +557,16 @@ mod tests {
             due: Some("2026-11-20".parse().unwrap()),
             parent: None,
             stamp: 0,
+            done: None,
+            added: None,
+            every: None,
+            next: None,
         }
     }
 
     /// `edit` as of Wednesday 2026-11-11, 10:30.
     fn edit(task: &mut Task, s: &str) -> Result<(), String> {
-        super::edit(task, &words(s), date(2026, 11, 11).at(10, 30, 0, 0))
+        super::edit(task, &words(s), date(2026, 11, 11).at(10, 30, 0, 0)).map(|_| ())
     }
 
     #[test]
@@ -514,6 +641,12 @@ mod tests {
         // The words of a quoted string as of separate ones.
         let p = parse(&["call mom //tomorrow 9am".to_string()]).unwrap();
         assert_eq!(p.due.unwrap().to_string(), "2026-11-12 09:00");
+        // A day with its year, a comma in it too.
+        let p = parse(&words("file taxes //december 31, 2026 +money")).unwrap();
+        assert_eq!(
+            (p.title.as_str(), p.due.unwrap().to_string()),
+            ("file taxes", "2026-12-31".into())
+        );
     }
 
     #[test]
@@ -542,6 +675,8 @@ mod tests {
                 "`//fri call him` isn't a date",
             ),
             ("pay rent //feb 30", "`//feb 30` isn't a date"),
+            ("pay rent //feb 30 2027", "`//feb 30 2027` isn't a date"),
+            ("pay rent //dec 2026", "`//dec 2026` isn't a date"),
             ("pay rent //fri sat", "`//fri sat` isn't a date"),
             ("pay rent //", "`//` needs a date"),
             ("pay rent // +home", "`//` needs a date"),
@@ -651,9 +786,12 @@ mod tests {
         }
         // In the change: taken off, which isn't left alone.
         let now = date(2026, 11, 11).at(10, 30, 0, 0);
-        let off = change(&["//".into()], now, |_| false).unwrap();
+        let off = change(&["//".into()], now, |_| false, false).unwrap();
         assert_eq!(off.due, Some(None));
-        assert_eq!(change(&["x".into()], now, |_| false).unwrap().due, None);
+        assert_eq!(
+            change(&["x".into()], now, |_| false, false).unwrap().due,
+            None
+        );
         // Two are refused still, empty or not.
         let mut task = dated();
         assert_eq!(
@@ -664,6 +802,151 @@ mod tests {
         // add refuses them, quoted as ever.
         assert_eq!(parse(&words("x //")), Err("`//` needs a date".into()));
         assert_eq!(parse(&words("//")), Err("`//` needs a date".into()));
+    }
+
+    #[test]
+    fn a_repeat_is_part_of_the_date_inside_the_slashes() {
+        let read = |s: &str| {
+            let p = parse(&words(s)).unwrap();
+            (
+                p.title,
+                p.due.unwrap().to_string(),
+                p.every.map(|e| e.to_string()),
+            )
+        };
+        let r = |title: &str, due: &str, every: &str| {
+            (title.to_string(), due.to_string(), Some(every.to_string()))
+        };
+        // With a date: the first one; the time kept.
+        assert_eq!(
+            read("pay rent //dec 1 every 2 weeks +home"),
+            r("pay rent", "2026-12-01", "2 weeks")
+        );
+        assert_eq!(
+            read("standup //fri 6pm every week"),
+            r("standup", "2026-11-13 18:00", "week")
+        );
+        assert_eq!(
+            read("rent //jan 31 every month"),
+            r("rent", "2027-01-31", "month on the 31st")
+        );
+        assert_eq!(
+            read("rent //dec 1 monthly"),
+            r("rent", "2026-12-01", "month on the 1st")
+        );
+        // Without one: the step's next match from today, today included.
+        assert_eq!(read("water //every fri"), r("water", "2026-11-13", "week"));
+        assert_eq!(read("water //every wed"), r("water", "2026-11-11", "week"));
+        assert_eq!(read("water //every day"), r("water", "2026-11-11", "day"));
+        assert_eq!(read("water //daily"), r("water", "2026-11-11", "day"));
+        assert_eq!(
+            read("rent //every month"),
+            r("rent", "2026-11-11", "month on the 11th")
+        );
+        assert_eq!(
+            read("tax //every year"),
+            r("tax", "2026-11-11", "year on the 11th")
+        );
+        // A weekday step with a date: that weekday, on or after it.
+        assert_eq!(read("x //dec 1 every fri"), r("x", "2026-12-04", "week"));
+        // `every` outside the slashes is a word of the title.
+        let p = parse(&words("read every page //fri")).unwrap();
+        assert_eq!((p.title.as_str(), p.every), ("read every page", None));
+        // Anything else after `every`: refused in the date's words.
+        for (s, err) in [
+            ("x //every fortnite", "`//every fortnite` isn't a date"),
+            ("x //every", "`//every` isn't a date"),
+            ("x //fri every 0 days", "`//fri every 0 days` isn't a date"),
+            (
+                "x //fridya every week",
+                "`//fridya every week` isn't a date",
+            ),
+        ] {
+            assert_eq!(parse(&words(s)), Err(err.into()), "{s}");
+        }
+    }
+
+    #[test]
+    fn edit_moves_the_date_and_keeps_the_step_changes_both_or_stops_it() {
+        let weekly = || {
+            let mut task = rent();
+            task.due = Some("2026-11-13".parse().unwrap());
+            task.every = Some("week".parse().unwrap());
+            task
+        };
+        let mut task = weekly();
+        edit(&mut task, "//sat").unwrap();
+        assert_eq!(task.due.unwrap().to_string(), "2026-11-14");
+        assert_eq!(task.every.unwrap().to_string(), "week", "kept");
+        let mut task = weekly();
+        edit(&mut task, "//sat every 2 weeks").unwrap();
+        assert_eq!(task.every.unwrap().to_string(), "2 weeks");
+        let mut task = weekly();
+        edit(&mut task, "-every").unwrap();
+        assert_eq!(
+            (task.every, task.due.is_some()),
+            (None, true),
+            "stopped, the date kept"
+        );
+        let mut task = weekly();
+        edit(&mut task, "//").unwrap();
+        assert_eq!((task.every, task.due), (None, None), "no date, no repeat");
+        // A moved month step aims at its new day.
+        let mut task = rent();
+        task.due = Some("2027-01-31".parse().unwrap());
+        task.every = Some("month on the 31st".parse().unwrap());
+        edit(&mut task, "//2027-02-05").unwrap();
+        assert_eq!(task.every.unwrap().to_string(), "month on the 5th");
+        // With no step: `-every` alone is refused, as a -tag it hasn't is;
+        // among other words it's one of them.
+        let mut task = rent();
+        assert_eq!(edit(&mut task, "-every"), Err("1 doesn't repeat".into()));
+        edit(&mut task, "pay -every").unwrap();
+        assert_eq!(task.title, "pay -every");
+    }
+
+    #[test]
+    fn the_line_e_fills_in_holds_the_repeat_and_reads_back_as_the_task() {
+        let now = date(2026, 11, 11).at(10, 30, 0, 0);
+        for (due, every, line) in [
+            ("2026-11-13", "week", "pay rent //2026-11-13 every week"),
+            (
+                "2026-11-13T18:00",
+                "2 weeks",
+                "pay rent //2026-11-13 6pm every 2 weeks",
+            ),
+            (
+                "2027-01-31",
+                "month on the 31st",
+                "pay rent //2027-01-31 every month",
+            ),
+            (
+                "2027-02-28",
+                "month on the 31st",
+                "pay rent //2027-02-28 every month on the 31st",
+            ),
+        ] {
+            let mut task = rent();
+            task.due = Some(due.parse().unwrap());
+            task.every = Some(every.parse().unwrap());
+            assert_eq!(edit_line(&task, now).0, line);
+            let mut back = task.clone();
+            super::edit(&mut back, &[line.to_string()], now).unwrap();
+            assert_eq!(back, task, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_calendar_writes_only_the_dates_words() {
+        for (text, date_words) in [
+            ("x //fri every week +home", "fri"),
+            ("x //fri 6pm daily", "fri 6pm"),
+            ("x //every fri", ""),
+            ("x //fri +home", "fri"),
+        ] {
+            let at = text.find("//").unwrap();
+            assert_eq!(&text[marked_date(text, at)], date_words, "{text}");
+        }
     }
 
     #[test]

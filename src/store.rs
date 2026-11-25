@@ -1,9 +1,11 @@
 //! The tasks file: one JSON object a line.
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::task::{self, Task};
 
@@ -39,7 +41,87 @@ pub fn load(path: &Path) -> Result<Vec<Task>, String> {
         })
         .collect::<Result<Vec<Task>, String>>()?;
     task::stamp_unstamped(&mut tasks);
+    task::drop_stray_done(&mut tasks);
     Ok(tasks)
+}
+
+/// Where the lock that orders changes to the tasks file at `path` is taken: a
+/// file of its own beside it (`tasks.jsonl.lock`), never written to.
+pub fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension("jsonl.lock")
+}
+
+/// How long a change waits for another halil to let go of the tasks file
+/// before it's said, not hung.
+pub const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// The lock on the tasks file at `path`, held until the file it returns is
+/// dropped: an advisory lock on [`lock_path`] (`flock` on Unix, `LockFileEx`
+/// on Windows), which every halil takes before it reads the tasks to change
+/// them, and the system lets go of when the process ends, however it ends.
+/// Waited for at most [`LOCK_WAIT`].
+pub fn lock(path: &Path) -> Result<File, String> {
+    lock_within(path, LOCK_WAIT)
+}
+
+/// [`lock`], waiting at most `wait`; past that, `tasks.jsonl is in use by
+/// another halil — nothing changed`.
+pub fn lock_within(path: &Path, wait: Duration) -> Result<File, String> {
+    let at = lock_path(path);
+    let fail = |e: io::Error| format!("can't lock {}: {e}", at.display());
+    if let Some(dir) = at.parent() {
+        fs::create_dir_all(dir).map_err(fail)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&at)
+        .map_err(fail)?;
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if start.elapsed() < wait => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(TryLockError::WouldBlock) => {
+                let name = path.file_name().unwrap_or(path.as_os_str());
+                return Err(format!(
+                    "{} is in use by another halil — nothing changed",
+                    name.to_string_lossy()
+                ));
+            }
+            Err(TryLockError::Error(e)) => return Err(fail(e)),
+        }
+    }
+}
+
+/// Makes a change to the tasks file at `path` as one step: under its
+/// [`lock`], held from the read to the write, so a change another halil made
+/// meanwhile (a command, or the board) is read first and never written over.
+/// `change` gets the tasks as they are on disk, and gives back what it says
+/// and whether to save them.
+pub fn update<T>(
+    path: &Path,
+    change: impl FnOnce(&mut Vec<Task>) -> Result<(T, bool), String>,
+) -> Result<T, String> {
+    update_within(path, LOCK_WAIT, change)
+}
+
+/// [`update`], waiting at most `wait` for the lock.
+pub fn update_within<T>(
+    path: &Path,
+    wait: Duration,
+    change: impl FnOnce(&mut Vec<Task>) -> Result<(T, bool), String>,
+) -> Result<T, String> {
+    let _held = lock_within(path, wait)?;
+    let mut tasks = load(path)?;
+    let (said, changed) = change(&mut tasks)?;
+    if changed {
+        save(path, &tasks)?;
+    }
+    Ok(said)
 }
 
 /// Writes every task, replacing the file whole: written beside it first, then
@@ -92,6 +174,10 @@ mod tests {
                 due: None,
                 parent: None,
                 stamp: 1_763_500_000_001,
+                done: None,
+                added: None,
+                every: None,
+                next: None,
             },
             Task {
                 id: 2,
@@ -102,6 +188,10 @@ mod tests {
                 due: Some("2026-11-20T09:00".parse().unwrap()),
                 parent: None,
                 stamp: 1_763_500_000_002,
+                done: None,
+                added: None,
+                every: None,
+                next: None,
             },
         ]
     }
@@ -138,6 +228,173 @@ mod tests {
                 "\n",
             )
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn done_and_added_are_kept_as_written_a_bad_one_refuses_its_line_a_stray_done_goes() {
+        let dir = temp_dir("times");
+        let path = dir.join("tasks.jsonl");
+        let lines = concat!(
+            r#"{"id":1,"title":"pay rent","status":"done","stamp":1763500000001,"done":"2026-11-25T18:04:00+09:00[Asia/Seoul]","added":"2026-11-20T09:00:00-05:00"}"#,
+            "\n",
+        );
+        fs::write(&path, lines).unwrap();
+        let tasks = load(&path).unwrap();
+        assert_eq!(
+            tasks[0].done.as_ref().map(|d| d.to_string()).as_deref(),
+            Some("2026-11-25T18:04:00+09:00[Asia/Seoul]")
+        );
+        save(&path, &tasks).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            lines,
+            "written back as read"
+        );
+
+        for (line, said) in [
+            (
+                r#"{"id":1,"title":"x","status":"done","done":"friday"}"#,
+                "`friday`",
+            ),
+            (
+                r#"{"id":1,"title":"x","added":"2026-11-25"}"#,
+                "`2026-11-25`",
+            ),
+        ] {
+            fs::write(&path, format!("{line}\n")).unwrap();
+            let err = load(&path).unwrap_err();
+            assert!(
+                err.contains("tasks.jsonl:1: not a task") && err.contains(said),
+                "{err}"
+            );
+        }
+
+        fs::write(
+            &path,
+            r#"{"id":1,"title":"x","status":"todo","done":"2026-11-25T18:04:00+09:00"}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap()[0].done, None, "not done: no done time");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn changes_made_at_once_each_see_the_others_under_the_lock() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = temp_dir("at-once");
+        let path = dir.join("tasks.jsonl");
+        // Threads standing in for halil processes, each adding a task at
+        // once, with time between its read and its write.
+        let n = 12;
+        let start = Arc::new(Barrier::new(n));
+        let adds: Vec<_> = (0..n)
+            .map(|k| {
+                let (path, start) = (path.clone(), Arc::clone(&start));
+                thread::spawn(move || {
+                    start.wait();
+                    update(&path, |tasks| {
+                        let id = task::next_id(tasks);
+                        thread::sleep(Duration::from_millis(5));
+                        tasks.push(Task {
+                            id,
+                            title: format!("added by {k}"),
+                            status: Status::Todo,
+                            priority: None,
+                            tags: vec![],
+                            due: None,
+                            parent: None,
+                            stamp: 1_763_500_000_000 + k as u64,
+                            done: None,
+                            added: None,
+                            every: None,
+                            next: None,
+                        });
+                        Ok(((), true))
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for add in adds {
+            add.join().unwrap();
+        }
+        let tasks = load(&path).unwrap();
+        let mut ids: Vec<u32> = tasks.iter().map(|t| t.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=n as u32).collect::<Vec<_>>(), "every one kept");
+        for k in 0..n {
+            assert!(
+                tasks.iter().any(|t| t.title == format!("added by {k}")),
+                "{k}"
+            );
+        }
+        // The lock is a file of its own beside the tasks; nothing else is.
+        assert!(lock_path(&path).is_file());
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["tasks.jsonl", "tasks.jsonl.lock"]);
+        // A change that saves nothing writes nothing.
+        let before = fs::read_to_string(&path).unwrap();
+        update(&path, |tasks| Ok((tasks.len(), false))).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_wait_that_doesnt_end_is_said_and_changes_nothing() {
+        let dir = temp_dir("held");
+        let path = dir.join("tasks.jsonl");
+        save(&path, &sample()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        // A stand-in for another halil, holding the lock and never letting go.
+        let held = lock(&path).unwrap();
+        let start = Instant::now();
+        // In a thread of its own, so a wait that never ends fails the row
+        // instead of hanging it.
+        let (said, got) = std::sync::mpsc::channel();
+        {
+            let path = path.clone();
+            thread::spawn(move || {
+                let r = update_within(&path, Duration::from_millis(300), |tasks| {
+                    tasks.clear();
+                    Ok(((), true))
+                });
+                let _ = said.send(r);
+            });
+        }
+        let err = got
+            .recv_timeout(Duration::from_secs(3))
+            .expect("said within the wait, not hung")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "tasks.jsonl is in use by another halil — nothing changed"
+        );
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "nothing changed"
+        );
+        // Let go, and the change goes through; the system lets go of a lock
+        // when its file is closed, as when a process ends.
+        drop(held);
+        update_within(&path, Duration::from_millis(300), |tasks| {
+            Ok((tasks.len(), false))
+        })
+        .unwrap();
+        assert_eq!(LOCK_WAIT, Duration::from_secs(5));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -219,6 +476,10 @@ mod tests {
                 .iter()
                 .map(|t| Task {
                     stamp: 0,
+                    done: None,
+                    added: None,
+                    every: None,
+                    next: None,
                     ..t.clone()
                 })
                 .collect();

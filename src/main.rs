@@ -1,6 +1,8 @@
 mod board;
+mod cal;
 mod clip;
 mod date;
+mod filter;
 mod hangul;
 mod list;
 mod parse;
@@ -9,11 +11,13 @@ mod task;
 
 use std::env;
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use jiff::civil::DateTime;
+use jiff::Zoned;
 
+use date::Local;
 use task::{Status, Task};
 
 /// A small task manager for the terminal.
@@ -32,11 +36,16 @@ enum Command {
     #[command(after_help = "Example: halil add \"pay rent friday 9am +home !high\"")]
     Add {
         /// The task in plain English: a date (or //fri 6pm), +tags, !high, !med or !low
-        #[arg(required = true, trailing_var_arg = true)]
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
-    /// List open tasks, what's due first (the default)
-    List,
+    /// List open tasks, what's due first (the default); words, +tags, !priority
+    /// and //fri, //by fri or //late narrow it
+    #[command(after_help = "Example: halil list +home //by fri")]
+    List {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        filter: Vec<String>,
+    },
     /// Mark a task as started
     Start { id: u32 },
     /// Mark a task as done, and its open sub items
@@ -44,7 +53,7 @@ enum Command {
     /// Change a task: new words replace its title; a date, +tags, -tags and !priority update it
     Edit {
         id: u32,
-        #[arg(required = true, trailing_var_arg = true)]
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
     /// Remove a task, and its sub items
@@ -53,16 +62,24 @@ enum Command {
     #[command(after_help = "Example: halil sub 3 write the tests friday")]
     Sub {
         id: u32,
-        #[arg(required = true, trailing_var_arg = true)]
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
-    /// Open the board: Todo, Doing, Done
-    Board,
+    /// Open the board: Todo, Doing, Done; a filter as list's, on
+    Board {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        filter: Vec<String>,
+    },
+    /// Open the board's calendar: each day's due and done, and what's on it
+    Cal {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        filter: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli.command.unwrap_or(Command::List)) {
+    match run(cli.command.unwrap_or(Command::List { filter: vec![] })) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("halil: {e}");
@@ -72,21 +89,32 @@ fn main() -> ExitCode {
 }
 
 fn run(command: Command) -> Result<(), String> {
-    let path = store::default_path()?;
-    let mut tasks = store::load(&path)?;
-    let now = jiff::Zoned::now().datetime();
+    run_at(&store::default_path()?, command)
+}
 
+/// Runs `command` on the tasks file at `path`. A change is read, made and
+/// written under the file's lock (see [`store::update`]), so commands run at
+/// once each see the other's change.
+fn run_at(path: &Path, command: Command) -> Result<(), String> {
+    let now = jiff::Zoned::now();
+    let read = |words: &[String]| filter::read(&words.join(" "), now.datetime());
     match command {
-        Command::List => {
+        Command::List { filter } => {
             let color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
-            print!("{}", list::render(&tasks, now, color));
+            let filter = read(&filter)?;
+            print!(
+                "{}",
+                list::render(&store::load(path)?, now.datetime(), color, &filter)
+            );
         }
-        Command::Board => board::run(&path, tasks)?,
+        Command::Board { filter } => board::run(path, store::load(path)?, false, read(&filter)?)?,
+        Command::Cal { filter } => board::run(path, store::load(path)?, true, read(&filter)?)?,
         command => {
-            let said = change(command, &mut tasks, now)?;
-            if said.changed {
-                store::save(&path, &tasks)?;
-            }
+            let said = store::update(path, |tasks| {
+                let said = change(command, tasks, &now)?;
+                let changed = said.changed;
+                Ok((said, changed))
+            })?;
             print!("{}", said.text);
         }
     }
@@ -100,13 +128,14 @@ struct Said {
     changed: bool,
 }
 
-/// Makes the change a command asks for to `tasks`, read as of `now`: every
-/// command but `list` and `board`.
-fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said, String> {
+/// Makes the change a command asks for to `tasks`, read as of `zoned`: every
+/// command but `list`, `board` and `cal`.
+fn change(command: Command, tasks: &mut Vec<Task>, zoned: &Zoned) -> Result<Said, String> {
+    let now = zoned.datetime();
     let said = |text: String, changed| Ok(Said { text, changed });
     match command {
         Command::Add { words } => {
-            let task = new_task(tasks, parse::parse(&words, now)?, None);
+            let task = new_task(tasks, parse::parse(&words, now)?, None, zoned);
             let added = format!("Added {task}\n");
             tasks.push(task);
             said(added, true)
@@ -117,7 +146,11 @@ fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said
                 return Err(format!("{id} is a sub item: they go one level deep"));
             }
             let under = parent.to_string();
-            let task = new_task(tasks, parse::parse(&words, now)?, Some(id));
+            let parsed = parse::parse(&words, now)?;
+            if parsed.every.is_some() {
+                return Err(REPEATS_WITH_ITS_CARD.into());
+            }
+            let task = new_task(tasks, parsed, Some(id), zoned);
             let added = format!("Added {task}\n  under {under}\n");
             tasks.push(task);
             said(added, true)
@@ -130,7 +163,7 @@ fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said
                 .collect();
             let was_done = tasks[i].status == Status::Done;
             for &s in open.iter().chain([&i]) {
-                tasks[s].status = Status::Done;
+                task::set_status(&mut tasks[s], Status::Done, zoned);
             }
             let mut text = match was_done {
                 true => format!("Already done {}\n", tasks[i]),
@@ -143,6 +176,11 @@ fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said
                     (true, n) => format!("Its {n} open sub items are done now."),
                     (false, n) => task::done_with(n, false),
                 };
+                text.push('\n');
+            }
+            let rolled = task::roll_repeats(tasks, zoned);
+            if let Some(next) = task::next_said(&rolled, now.date()) {
+                text += &next;
                 text.push('\n');
             }
             said(text, !was_done || !open.is_empty())
@@ -164,24 +202,55 @@ fn change(command: Command, tasks: &mut Vec<Task>, now: DateTime) -> Result<Said
             said(text, true)
         }
         Command::Start { id } => {
-            let task = find(tasks, id)?;
-            if task.status == Status::Doing {
-                return said(format!("Already started {task}\n"), false);
+            let i = position(tasks, id)?;
+            if tasks[i].status == Status::Doing {
+                return said(format!("Already started {}\n", tasks[i]), false);
             }
-            task.status = Status::Doing;
-            said(format!("Started {task}\n"), true)
+            let reopened = task::reopened_said(tasks, i);
+            task::set_status(&mut tasks[i], Status::Doing, zoned);
+            let mut text = format!("Started {}\n", tasks[i]);
+            if let Some(reopened) = reopened {
+                text += &reopened;
+                text.push('\n');
+            }
+            said(text, true)
         }
         Command::Edit { id, words } => {
             let task = find(tasks, id)?;
-            parse::edit(task, &words, now)?;
-            said(format!("Changed {task}\n"), true)
+            let change = parse::edit(task, &words, now)?;
+            let mut text = format!("Changed {task}\n");
+            if let Some(still) = still_said(&change, task) {
+                text += &still;
+                text.push('\n');
+            }
+            said(text, true)
         }
-        Command::List | Command::Board => unreachable!("run shows these"),
+        Command::List { .. } | Command::Board { .. } | Command::Cal { .. } => {
+            unreachable!("run shows these")
+        }
     }
 }
 
-/// A new open task of `parsed`'s words, under `parent` if one's given.
-fn new_task(tasks: &[Task], parsed: parse::Parsed, parent: Option<u32>) -> Task {
+/// Refused for `sub … every`, and `A` with `every` on the board.
+pub const REPEATS_WITH_ITS_CARD: &str =
+    "a sub item repeats with its card: give `every` to the card";
+
+/// `Still every month — -every stops it.`: when the words of an edit gave the
+/// date and no `every …`, which leaves a repeating task's repeat on (the
+/// date's rule: taking its words out of `e`'s line leaves it).
+pub fn still_said(change: &parse::Change, task: &Task) -> Option<String> {
+    let (Some(Some(due)), None, Some(every)) = (change.due, change.every, task.every) else {
+        return None;
+    };
+    Some(format!(
+        "Still {} — -every stops it.",
+        every.words(due.date)
+    ))
+}
+
+/// A new open task of `parsed`'s words, under `parent` if one's given, made
+/// `now`.
+fn new_task(tasks: &[Task], parsed: parse::Parsed, parent: Option<u32>, now: &Zoned) -> Task {
     Task {
         id: task::next_id(tasks),
         title: parsed.title,
@@ -191,6 +260,10 @@ fn new_task(tasks: &[Task], parsed: parse::Parsed, parent: Option<u32>) -> Task 
         due: parsed.due,
         parent,
         stamp: task::new_stamp(tasks, task::now_ms()),
+        done: None,
+        added: Some(Local::of(now)),
+        every: parsed.every,
+        next: None,
     }
 }
 
@@ -227,6 +300,10 @@ mod tests {
             due: None,
             parent,
             stamp: 0,
+            done: None,
+            added: None,
+            every: None,
+            next: None,
         }
     }
 
@@ -236,11 +313,17 @@ mod tests {
 
     /// `change` as of Wednesday 2026-11-11, 10:30: what it said, or its error.
     fn run(command: Command, tasks: &mut Vec<Task>) -> Result<Said, String> {
-        change(
-            command,
-            tasks,
-            jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0),
-        )
+        change(command, tasks, &wednesday())
+    }
+
+    /// Wednesday 2026-11-11, 10:30, in Seoul's offset (a zone with no name,
+    /// so no tz database is needed).
+    fn wednesday() -> Zoned {
+        let seoul = jiff::tz::TimeZone::fixed(jiff::tz::offset(9));
+        jiff::civil::date(2026, 11, 11)
+            .at(10, 30, 0, 0)
+            .to_zoned(seoul)
+            .unwrap()
     }
 
     /// Task 3, ship 0.2.0, with sub items 5 (done) and 6 and 7 (open), and an
@@ -253,6 +336,231 @@ mod tests {
             task(6, "write the tests", Status::Todo, Some(3)),
             task(7, "tag the release", Status::Doing, Some(3)),
         ]
+    }
+
+    /// The words clap gives a command, from the command line.
+    fn words_of(args: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        match cli.command {
+            Some(Command::Add { words })
+            | Some(Command::Edit { words, .. })
+            | Some(Command::Sub { words, .. }) => words,
+            _ => panic!("{args:?}"),
+        }
+    }
+
+    #[test]
+    fn a_minus_tag_first_on_the_command_line_is_a_word_not_an_option() {
+        // 0.4.2 read `-home` as `-h`, its help, and changed nothing.
+        assert_eq!(words_of(&["halil", "edit", "3", "-home"]), ["-home"]);
+        assert_eq!(
+            words_of(&["halil", "edit", "3", "-home", "+work", "!low"]),
+            ["-home", "+work", "!low"]
+        );
+        assert_eq!(
+            words_of(&["halil", "add", "-urgent", "call"]),
+            ["-urgent", "call"]
+        );
+        assert_eq!(
+            words_of(&["halil", "sub", "1", "-x", "first"]),
+            ["-x", "first"]
+        );
+        // A tag named h: after `--`, as `-h` alone is help.
+        assert_eq!(words_of(&["halil", "edit", "3", "--", "-h"]), ["-h"]);
+        let help = Cli::try_parse_from(["halil", "edit", "3", "-h"])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+
+        // From the command line to the task: tags off and on.
+        let mut tasks = ship();
+        tasks[1].tags = vec!["home".into(), "money".into()];
+        for (args, tags) in [
+            (&["halil", "edit", "4", "-home"][..], &["money"][..]),
+            (&["halil", "edit", "4", "+work", "-money"], &["work"]),
+            (
+                &["halil", "edit", "4", "-work", "+car", "+home"],
+                &["car", "home"],
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            run(cli.command.unwrap(), &mut tasks).unwrap();
+            assert_eq!(tasks[1].tags, tags, "{args:?}");
+            assert_eq!(tasks[1].title, "buy milk", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn done_on_a_repeat_says_the_next_start_says_where_it_went_edit_keeps_the_step() {
+        let mut tasks = ship();
+        tasks[1].due = Some("2026-11-13".parse().unwrap());
+        tasks[1].every = Some("week".parse().unwrap());
+        let said = run(Command::Done { id: 4 }, &mut tasks).unwrap();
+        assert_eq!(
+            said.text,
+            "Done 4: buy milk due Fri 2026-11-13 every week\nDone. Next: fri nov 20.\n"
+        );
+        let next = tasks.last().unwrap().clone();
+        assert_eq!(
+            (next.title.as_str(), next.due.unwrap().to_string()),
+            ("buy milk", "2026-11-20".into())
+        );
+        let said = run(Command::Start { id: 4 }, &mut tasks).unwrap();
+        assert_eq!(
+            said.text,
+            format!(
+                "Started 4: buy milk due Fri 2026-11-13\nReopened. Its repeat is on #{}.\n",
+                next.id
+            )
+        );
+        let said = run(
+            Command::Edit {
+                id: next.id,
+                words: words("//sat"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        assert!(
+            said.text
+                .ends_with("\nStill every week — -every stops it.\n"),
+            "{}",
+            said.text
+        );
+        // A sub item repeats with its card.
+        assert_eq!(
+            run(
+                Command::Sub {
+                    id: 3,
+                    words: words("x //every week"),
+                },
+                &mut tasks,
+            )
+            .unwrap_err(),
+            REPEATS_WITH_ITS_CARD
+        );
+    }
+
+    #[test]
+    fn done_under_the_lock_racing_an_add_makes_one_next_and_keeps_the_add() {
+        let dir =
+            std::env::temp_dir().join(format!("halil-test-{}-repeat-race", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.jsonl");
+        let mut rent = task(1, "pay rent", Status::Todo, None);
+        rent.stamp = 1_763_500_000_001;
+        rent.due = Some("2026-11-13".parse().unwrap());
+        rent.every = Some("week".parse().unwrap());
+        store::save(&path, &[rent]).unwrap();
+        // Eight `halil done 1` and an add, all at once.
+        let start = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let mut runs: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    run_at(&path, Command::Done { id: 1 })
+                })
+            })
+            .collect();
+        runs.push({
+            let (path, start) = (path.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                run_at(
+                    &path,
+                    Command::Add {
+                        words: words("buy milk"),
+                    },
+                )
+            })
+        });
+        for r in runs {
+            r.join().unwrap().unwrap();
+        }
+        let after = store::load(&path).unwrap();
+        let rents: Vec<&Task> = after.iter().filter(|t| t.title == "pay rent").collect();
+        assert_eq!(
+            rents.len(),
+            2,
+            "the done one and one next, not two: {after:?}"
+        );
+        assert_eq!(rents.iter().filter(|t| t.every.is_some()).count(), 1);
+        assert!(after.iter().any(|t| t.title == "buy milk"), "the add kept");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_command_waits_for_the_lock_and_then_sees_the_file_as_it_is() {
+        let dir = std::env::temp_dir().join(format!("halil-test-{}-main-lock", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.jsonl");
+        let mut tasks = vec![task(1, "pay rent", Status::Todo, None)];
+        tasks[0].stamp = 1_763_500_000_001;
+        store::save(&path, &tasks).unwrap();
+        // Another halil holds the lock and writes a task meanwhile.
+        let held = store::lock(&path).unwrap();
+        let add = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                run_at(
+                    &path,
+                    Command::Add {
+                        words: words("buy milk"),
+                    },
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!add.is_finished(), "the command waits for the lock");
+        let mut other = task(2, "call mum", Status::Todo, None);
+        other.stamp = 1_763_500_000_002;
+        tasks.push(other);
+        store::save(&path, &tasks).unwrap();
+        drop(held);
+        add.join().unwrap().unwrap();
+        let after = store::load(&path).unwrap();
+        let titles: Vec<&str> = after.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["pay rent", "call mum", "buy milk"]);
+        assert_eq!(after[2].id, 3, "after the other's task");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn done_keeps_when_it_was_done_start_clears_it_and_add_and_sub_keep_when_made() {
+        let made = Some(Local::of(&wednesday()));
+        let mut tasks = ship();
+        run(Command::Done { id: 3 }, &mut tasks).unwrap();
+        let by_id = |tasks: &[Task], id: u32| tasks.iter().find(|t| t.id == id).unwrap().clone();
+        for id in [3, 6, 7] {
+            assert_eq!(by_id(&tasks, id).done, made, "{id}, and its open sub items");
+        }
+        assert_eq!(by_id(&tasks, 5).done, None, "done before: not known");
+        run(Command::Start { id: 3 }, &mut tasks).unwrap();
+        assert_eq!(by_id(&tasks, 3).done, None);
+        assert_eq!(by_id(&tasks, 6).done, made, "its sub items stay done");
+        run(
+            Command::Add {
+                words: words("buy milk"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        run(
+            Command::Sub {
+                id: 4,
+                words: words("oat milk"),
+            },
+            &mut tasks,
+        )
+        .unwrap();
+        let n = tasks.len();
+        for t in &tasks[n - 2..] {
+            assert_eq!(t.added, made, "{}", t.title);
+            assert_eq!(t.done, None);
+        }
     }
 
     #[test]

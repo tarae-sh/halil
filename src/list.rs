@@ -3,21 +3,28 @@ use std::cmp::Reverse;
 use jiff::civil::{DateTime, Time};
 
 use crate::date::Due;
+use crate::filter::Filter;
 use crate::task::{self, Priority, Status, Task};
 
 /// The open tasks as a table: soonest due first (so late ones lead), undated
 /// after, then highest priority, then oldest. A task's open sub items come
 /// under it, indented, in id order, and how many of them are done after it.
 /// An open sub item whose task is done (as a hand-edited file may have it) is
-/// listed as a task of its own: no open task is left out.
-pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
+/// listed as a task of its own: no open task is left out. Under a `filter`,
+/// the tasks it shows (a card when it or a sub item matches), with their own
+/// numbers, so `halil done 7` works from a filtered list.
+pub fn render(tasks: &[Task], now: DateTime, color: bool, filter: &Filter) -> String {
     let parents = task::parents(tasks);
     let under_open = |i: usize| parents[i].is_some_and(|p| tasks[p].status != Status::Done);
     let mut cards: Vec<usize> = (0..tasks.len())
         .filter(|&i| !under_open(i) && tasks[i].status != Status::Done)
+        .filter(|&i| filter.shows(tasks, &parents, i, now.date()))
         .collect();
     if cards.is_empty() {
-        return "Nothing to do.\n".into();
+        return match filter.is_empty() {
+            true => "Nothing to do.\n".into(),
+            false => format!("Nothing matches {}.\n", filter.text),
+        };
     }
     cards.sort_by_key(|&i| {
         let t = &tasks[i];
@@ -49,10 +56,16 @@ pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
         .max()
         .unwrap_or(0)
         .max(2);
-    // The DUE column shows only when some task has a date.
+    // The DUE column shows only when some task has a date; a repeat's words
+    // after it, faint (`fri weekly`).
+    let step = |t: &Task| {
+        t.every
+            .map(|e| format!(" {}", e.short()))
+            .unwrap_or_default()
+    };
     let due_width = open
         .iter()
-        .filter_map(|(t, ..)| t.due.map(|d| due_words(d, now).0.len()))
+        .filter_map(|(t, ..)| t.due.map(|d| due_words(d, now).0.len() + step(t).len()))
         .max()
         .map(|w| w.max(3));
 
@@ -72,7 +85,9 @@ pub fn render(tasks: &[Task], now: DateTime, color: bool) -> String {
             line += &match t.due {
                 Some(d) => {
                     let (words, code) = due_words(d, now);
-                    paint(code, format!("{words:<w$}"))
+                    let step = step(t);
+                    let pad = w.saturating_sub(words.len() + step.len());
+                    paint(code, words) + &paint("2", step) + &" ".repeat(pad)
                 }
                 None => " ".repeat(w),
             };
@@ -154,6 +169,10 @@ mod tests {
             due: None,
             parent: None,
             stamp: 0,
+            done: None,
+            added: None,
+            every: None,
+            next: None,
         }
     }
 
@@ -181,7 +200,7 @@ mod tests {
         ];
         let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
         assert_eq!(
-            render(&tasks, now, false),
+            render(&tasks, now, false, &Filter::default()),
             concat!(
                 "ID  PRI   TASK\n",
                 " 3  high  ship 0.2.0  1/3  +work\n",
@@ -191,7 +210,9 @@ mod tests {
                 " 8        orphan\n",
             )
         );
-        assert!(render(&tasks, now, true).contains("ship 0.2.0  \x1b[2m1/3\x1b[0m"));
+        assert!(
+            render(&tasks, now, true, &Filter::default()).contains("ship 0.2.0  \x1b[2m1/3\x1b[0m")
+        );
     }
 
     #[test]
@@ -205,7 +226,7 @@ mod tests {
         ];
         let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
         assert_eq!(
-            render(&tasks, now, false),
+            render(&tasks, now, false, &Filter::default()),
             concat!(
                 "ID  PRI   TASK\n",
                 " 1        buy milk\n",
@@ -228,7 +249,7 @@ mod tests {
         ];
         let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
         assert_eq!(
-            render(&tasks, now, false),
+            render(&tasks, now, false, &Filter::default()),
             concat!(
                 "ID  PRI   TASK\n",
                 " 4  high  pay rent  +home\n",
@@ -264,7 +285,7 @@ mod tests {
         late.due = due(-2);
         let tasks = [undated, later, today, late];
         assert_eq!(
-            render(&tasks, now, false),
+            render(&tasks, now, false, &Filter::default()),
             concat!(
                 "ID  PRI   DUE      TASK\n",
                 " 4        2d late  pay rent\n",
@@ -297,10 +318,46 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_lists_what_it_shows_with_their_own_numbers() {
+        use crate::filter;
+        let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
+        let mut rent = task(4, "pay rent", Some(Priority::High), Status::Todo);
+        rent.tags = vec!["home".into()];
+        rent.due = Some("2026-11-09".parse().unwrap());
+        let mut milk = task(7, "buy milk", None, Status::Todo);
+        milk.due = Some("2026-11-13".parse().unwrap());
+        let tasks = [task(1, "read", None, Status::Todo), rent, milk];
+        let list = |text: &str| render(&tasks, now, false, &filter::read(text, now).unwrap());
+        assert_eq!(
+            list("+home"),
+            concat!(
+                "ID  PRI   DUE      TASK\n",
+                " 4  high  2d late  pay rent  +home\n"
+            )
+        );
+        assert_eq!(
+            list("//by fri"),
+            concat!(
+                "ID  PRI   DUE      TASK\n",
+                " 4  high  2d late  pay rent  +home\n",
+                " 7        fri      buy milk\n",
+            ),
+            "late ones too, each its own number"
+        );
+        assert_eq!(list("+work milk"), "Nothing matches +work milk.\n");
+    }
+
+    #[test]
     fn nothing_open_says_so() {
         let tasks = [task(1, "done", None, Status::Done)];
         let now = jiff::civil::date(2026, 11, 11).at(10, 30, 0, 0);
-        assert_eq!(render(&tasks, now, false), "Nothing to do.\n");
-        assert_eq!(render(&[], now, false), "Nothing to do.\n");
+        assert_eq!(
+            render(&tasks, now, false, &Filter::default()),
+            "Nothing to do.\n"
+        );
+        assert_eq!(
+            render(&[], now, false, &Filter::default()),
+            "Nothing to do.\n"
+        );
     }
 }

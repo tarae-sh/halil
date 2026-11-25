@@ -25,12 +25,15 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use jiff::Zoned;
 use jiff::civil::{Date, DateTime};
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::cal::{self, Group};
 use crate::clip::{self, Clipboard};
-use crate::date::{self, Due};
+use crate::date::{self, Due, Local};
+use crate::filter::{self, Filter};
 use crate::hangul;
 use crate::parse::{self, Change, Parsed};
 use crate::store;
@@ -53,8 +56,9 @@ const RED: Color = 203;
 const AMBER: Color = 215;
 const BLUE: Color = 74;
 
-/// Opens the board on the tasks file at `path` and runs it until `q`.
-pub fn run(path: &Path, tasks: Vec<Task>) -> Result<(), String> {
+/// Opens the board on the tasks file at `path`, or its calendar when `cal`
+/// (`halil cal`), `filter` on (none when it's empty), and runs it until `q`.
+pub fn run(path: &Path, tasks: Vec<Task>, cal: bool, filter: Filter) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("the board needs a terminal".into());
     }
@@ -62,6 +66,13 @@ pub fn run(path: &Path, tasks: Vec<Task>) -> Result<(), String> {
     let mut board = Board::new(tasks, Zoned::now().date());
     board.folded = load_folds(&folds_path(path));
     board.keep_folds_in_sight();
+    if cal {
+        board.open_cal(false);
+    }
+    if !filter.is_empty() {
+        board.filter = Some(filter);
+        board.refilter(None);
+    }
     let mut out = io::stdout();
     let _screen = Screen::enter(&mut out).map_err(term_err)?;
     event_loop(&mut board, path, &mut out, color, clip::detect())
@@ -170,16 +181,7 @@ fn event_loop(
                     }
                 },
                 Outcome::Change(op) => {
-                    match store::load(path) {
-                        Ok(fresh) => {
-                            board.replace_tasks(fresh);
-                            board.apply(op);
-                            if let Err(e) = store::save(path, &board.tasks) {
-                                board.message = Some(e);
-                            }
-                        }
-                        Err(e) => board.message = Some(e),
-                    }
+                    board.save_change(path, op);
                     seen = modified();
                 }
             }
@@ -376,6 +378,59 @@ pub struct Board {
     /// Whether the screen last drawn had room for the calendar: without it,
     /// the arrows and esc are the input's.
     cal_room: bool,
+    /// The calendar view, while it's up (`c`, `halil cal`).
+    cal: Option<CalView>,
+    /// The filter on (`/`, `halil board <filter>`): kept, or as it's typed.
+    filter: Option<Filter>,
+    /// While one is typed, the filter it replaces, back on `esc`.
+    filter_was: Option<Option<Filter>>,
+    /// What a change under the filter took out of it: shown, faint, until
+    /// the filter changes.
+    filter_faint: BTreeSet<Ref>,
+    /// The zone halil runs in: a stamp's day is read in it.
+    tz: TimeZone,
+}
+
+/// Where the calendar's keys go: the grid of days, the picked day's list, or
+/// the list of what has no date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Grid,
+    Day,
+    Unknown,
+}
+
+/// The calendar view: the day picked, where the keys go, the row picked in
+/// the list under the grid, and the list as it was before the last change,
+/// while the pick hasn't moved since: what left it stays, faint.
+#[derive(Debug, Clone)]
+struct CalView {
+    day: Date,
+    focus: Focus,
+    row: usize,
+    scroll: usize,
+    kept: Option<Vec<(Group, Ref)>>,
+    /// Opened from the board, where `esc` goes back to; else from `halil cal`,
+    /// and `esc` quits.
+    from_board: bool,
+}
+
+/// A row of the calendar's list: a task, what it's listed under, and whether
+/// it's left the list since the pick last moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    group: Group,
+    at: Ref,
+    faint: bool,
+}
+
+/// A day as the calendar's notes say it: `Fri 27 Nov`, with its year when
+/// it's not `today`'s.
+fn day_words(day: Date, today: Date) -> String {
+    match day.year() == today.year() {
+        true => day.strftime("%a %-d %b").to_string(),
+        false => day.strftime("%a %-d %b %Y").to_string(),
+    }
 }
 
 impl Board {
@@ -397,6 +452,402 @@ impl Board {
             folded: BTreeSet::new(),
             folds_changed: false,
             cal_room: true,
+            cal: None,
+            tz: TimeZone::system(),
+            filter: None,
+            filter_was: None,
+            filter_faint: BTreeSet::new(),
+        }
+    }
+
+    /// Whether the task at `i` is shown under the filter: it or (a card) one
+    /// of its sub items matches, or a change took it out of it meanwhile.
+    fn shown(&self, i: usize, parents: &[Option<usize>]) -> bool {
+        self.filter
+            .as_ref()
+            .is_none_or(|f| f.shows(&self.tasks, parents, i, self.today))
+            || self.filter_faint.contains(&self.held(i))
+    }
+
+    /// Whether the task at `i` stays only because a change took it out of the
+    /// filter: drawn faint.
+    fn faint_under_filter(&self, i: usize) -> bool {
+        self.filter_faint.contains(&self.held(i))
+    }
+
+    /// The tasks the filter shows (all of them with none), for the
+    /// calendar's counts.
+    fn visible(&self) -> Vec<Task> {
+        let parents = task::parents(&self.tasks);
+        (0..self.tasks.len())
+            .filter(|&i| self.shown(i, &parents))
+            .map(|i| self.tasks[i].clone())
+            .collect()
+    }
+
+    /// `3 of 12`: the cards the filter shows, of all.
+    fn filter_count(&self) -> (usize, usize) {
+        let parents = task::parents(&self.tasks);
+        let cards: Vec<usize> = (0..self.tasks.len())
+            .filter(|&i| parents[i].is_none())
+            .collect();
+        let shown = cards
+            .iter()
+            .filter(|&&i| {
+                self.filter
+                    .as_ref()
+                    .is_none_or(|f| f.shows(&self.tasks, &parents, i, self.today))
+            })
+            .count();
+        (shown, cards.len())
+    }
+
+    /// After the filter changed, the pick: on its card while that's shown,
+    /// else the first shown in its column, else the first shown.
+    fn refilter(&mut self, before: Option<Ref>) {
+        self.filter_faint.clear();
+        if let Some(at) = before
+            && let Some(i) = self.find(at)
+            && (0..COLUMNS.len()).any(|c| self.column(c).contains(&i))
+        {
+            self.pick(at.id);
+            return;
+        }
+        self.scroll = [0; 3];
+        if !self.column(self.col).is_empty() {
+            self.row = 0;
+        } else if let Some(c) = (0..COLUMNS.len()).find(|&c| !self.column(c).is_empty()) {
+            self.col = c;
+            self.row = 0;
+        }
+    }
+
+    /// `/`: the typing line as the filter, the kept one's words in it.
+    fn open_filter(&mut self) {
+        let text = self
+            .filter
+            .as_ref()
+            .map(|f| f.text.clone())
+            .unwrap_or_default();
+        self.filter_was = Some(self.filter.clone());
+        self.input = Some(Input::new(InputKind::Filter, text));
+    }
+
+    /// The filter as the words typed read so far, the columns narrowing.
+    fn filter_typed(&mut self) {
+        let before = self.board_pick();
+        let text = self
+            .input
+            .as_ref()
+            .map(|i| i.text.clone())
+            .unwrap_or_default();
+        let typed = filter::read_typing(&text, self.now());
+        self.filter = (!typed.is_empty()).then_some(typed);
+        self.refilter(before);
+    }
+
+    /// The board's own pick, the calendar up or not.
+    fn board_pick(&self) -> Option<Ref> {
+        self.column(self.col).get(self.row).map(|&i| self.held(i))
+    }
+
+    /// `c` on the board, or `halil cal`: the calendar, on today.
+    fn open_cal(&mut self, from_board: bool) {
+        self.cal = Some(CalView {
+            day: self.today,
+            focus: Focus::Grid,
+            row: 0,
+            scroll: 0,
+            kept: None,
+            from_board,
+        });
+    }
+
+    /// Back to the board: the marks it has no row for go.
+    fn close_cal(&mut self) {
+        self.cal = None;
+        self.keep_marks_in_sight();
+        self.clamp();
+    }
+
+    /// The list under the calendar's grid as it's to be shown, without what
+    /// left it: the picked day's, or what has no date.
+    fn fresh_entries(&self) -> Vec<(Group, Ref)> {
+        let Some(view) = &self.cal else {
+            return Vec::new();
+        };
+        let listed = match view.focus {
+            Focus::Unknown => cal::not_known(&self.tasks),
+            _ => cal::listed(&self.tasks, view.day, &self.tz),
+        };
+        let parents = task::parents(&self.tasks);
+        listed
+            .into_iter()
+            .filter(|&(_, i)| self.shown(i, &parents))
+            .map(|(g, i)| (g, self.held(i)))
+            .collect()
+    }
+
+    /// The list under the calendar's grid as it's shown: with what left it
+    /// since the last change, faint, in its place, until the pick moves.
+    fn entries(&self) -> Vec<Entry> {
+        let fresh = self.fresh_entries();
+        let entry = |(group, at): (Group, Ref), faint| Entry { group, at, faint };
+        match self.cal.as_ref().and_then(|v| v.kept.as_ref()) {
+            None => fresh.into_iter().map(|e| entry(e, false)).collect(),
+            Some(kept) => kept
+                .iter()
+                .filter(|(_, at)| self.find(*at).is_some())
+                .map(|&e| entry(e, !fresh.contains(&e)))
+                .chain(
+                    fresh
+                        .iter()
+                        .filter(|e| !kept.contains(e))
+                        .map(|&e| entry(e, false)),
+                )
+                .collect(),
+        }
+    }
+
+    /// The task picked in the calendar's list, as an index into `tasks`: none
+    /// while the keys are the grid's.
+    fn cal_picked(&self) -> Option<usize> {
+        let view = self.cal.as_ref()?;
+        if view.focus == Focus::Grid {
+            return None;
+        }
+        self.entries().get(view.row).and_then(|e| self.find(e.at))
+    }
+
+    /// A key in the calendar: the day's moves, the list's picks, and the keys
+    /// that act otherwise here. `None` for the board's own (`h`, `e`, `x`,
+    /// `y` ...), which act on the task picked in the list as on the board's.
+    fn cal_key(&mut self, key: KeyEvent) -> Option<Outcome> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        let shown = self.entries();
+        let rows = shown.len();
+        let visible = self.visible();
+        let day_rows = {
+            let view = self.cal.as_ref()?;
+            cal::listed(&visible, view.day, &self.tz).len()
+        };
+        let has_unknown = cal::not_known_line(&visible).is_some();
+        let picked = self.cal_picked();
+        let marked = !self.marked.is_empty();
+        let today = self.today;
+        let mut view = self.cal.clone()?;
+        let day = |view: &mut CalView, to: Option<Date>| {
+            if let Some(to) = to {
+                view.day = to;
+            }
+            view.focus = Focus::Grid;
+            view.row = 0;
+            view.scroll = 0;
+        };
+        let at = view.day;
+        let by = |span: jiff::Span| at.checked_add(span).ok();
+        let grid = view.focus == Focus::Grid;
+        match key.code {
+            KeyCode::Char('c') => {
+                self.close_cal();
+                return Some(Outcome::Nothing);
+            }
+            KeyCode::Esc if marked => return None,
+            KeyCode::Esc if self.filter.is_some() => {
+                self.clear_filter();
+                return Some(Outcome::Nothing);
+            }
+            KeyCode::Esc if view.from_board => {
+                self.close_cal();
+                return Some(Outcome::Nothing);
+            }
+            KeyCode::Esc => return Some(Outcome::Quit),
+            KeyCode::Left => day(&mut view, by(jiff::Span::new().days(-1))),
+            KeyCode::Right => day(&mut view, by(jiff::Span::new().days(1))),
+            KeyCode::PageUp => day(&mut view, by(jiff::Span::new().months(-1))),
+            KeyCode::PageDown => day(&mut view, by(jiff::Span::new().months(1))),
+            KeyCode::Char('T') => day(&mut view, Some(today)),
+            KeyCode::Up if grid => day(&mut view, by(jiff::Span::new().weeks(-1))),
+            KeyCode::Down if grid => day(&mut view, by(jiff::Span::new().weeks(1))),
+            KeyCode::Char('g') | KeyCode::Home if grid => day(&mut view, Some(at.first_of_month())),
+            KeyCode::Char('G') | KeyCode::End if grid => day(&mut view, Some(at.last_of_month())),
+            KeyCode::Char('j') if grid => {
+                if day_rows > 0 {
+                    view.focus = Focus::Day;
+                    view.row = 0;
+                }
+            }
+            KeyCode::Char('k') if grid => {}
+            KeyCode::Char('j') | KeyCode::Down => {
+                view.row = (view.row + 1).min(rows.saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => match view.row {
+                0 => view.focus = Focus::Grid,
+                n => view.row = n - 1,
+            },
+            KeyCode::Char('g') | KeyCode::Home => view.row = 0,
+            KeyCode::Char('G') | KeyCode::End => view.row = rows.saturating_sub(1),
+            KeyCode::Tab | KeyCode::BackTab => {
+                // The grid, the day's list, what has no date, round; a list
+                // with nothing in it is passed by.
+                let order = [Focus::Grid, Focus::Day, Focus::Unknown];
+                let there = |f: Focus| match f {
+                    Focus::Grid => true,
+                    Focus::Day => day_rows > 0,
+                    Focus::Unknown => has_unknown,
+                };
+                let at = order.iter().position(|&f| f == view.focus).unwrap_or(0);
+                let step = if key.code == KeyCode::Tab { 1 } else { 2 };
+                let mut next = at;
+                loop {
+                    next = (next + step) % order.len();
+                    if there(order[next]) {
+                        break;
+                    }
+                }
+                view.focus = order[next];
+                view.row = 0;
+                view.scroll = 0;
+            }
+            KeyCode::Char(' ') => {
+                let Some(i) = picked else {
+                    return Some(Outcome::Nothing);
+                };
+                let Ref { id, stamp } = self.held(i);
+                if self.marked.remove(&id) != Some(stamp) {
+                    self.marked.insert(id, stamp);
+                }
+                view.row = (view.row + 1).min(rows.saturating_sub(1));
+            }
+            // `d` is done: on a task done already, card or sub item, it keeps
+            // it, and its done time. Opening one again is a move (`h`, `s`,
+            // `t`), as on the board.
+            KeyCode::Char('d') if !marked => {
+                let i = picked?;
+                if self.tasks[i].status != Status::Done {
+                    return None;
+                }
+                self.note = Some(format!("{} is done already.", self.tasks[i].id));
+                return Some(Outcome::Nothing);
+            }
+            // A new task on the picked day: its date filled in, the cursor
+            // before it.
+            KeyCode::Char('a') => {
+                let mut input = match view.focus {
+                    Focus::Unknown => Input::new(InputKind::Add, String::new()),
+                    _ => Input::new(InputKind::Add, format!(" //{}", view.day)),
+                };
+                input.cursor = 0;
+                self.input = Some(input);
+                return Some(Outcome::Nothing);
+            }
+            KeyCode::Char('z') => {
+                self.message =
+                    Some("the calendar lists each task on its own: z folds on the board".into());
+                return Some(Outcome::Nothing);
+            }
+            _ => return None,
+        }
+        // The pick moved: what left the list goes, and the pick stays on the
+        // task it moved to, wherever the list without it puts it.
+        let target = (view.focus != Focus::Grid && view.kept.is_some())
+            .then(|| shown.get(view.row).map(|e| (e.group, e.at)))
+            .flatten();
+        view.kept = None;
+        self.cal = Some(view);
+        if let Some(target) = target {
+            let fresh = self.fresh_entries();
+            let row = fresh
+                .iter()
+                .position(|&e| e == target)
+                .or_else(|| fresh.iter().position(|e| e.1 == target.1));
+            if let (Some(row), Some(view)) = (row, self.cal.as_mut()) {
+                view.row = row;
+            }
+        }
+        Some(Outcome::Nothing)
+    }
+
+    /// Where task `i` is now, for a note: `due Fri 27 Nov`, `done on Wed 25
+    /// Nov`, `open, with no date`.
+    fn whereabouts(&self, i: usize) -> String {
+        let t = &self.tasks[i];
+        match (cal::done_day(t), t.status, t.due) {
+            (Some(day), _, _) => format!("done on {}", day_words(day, self.today)),
+            (None, Status::Done, _) => "done".into(),
+            (None, _, Some(due)) => format!("due {}", day_words(due.date, self.today)),
+            (None, _, None) => "open, with no date".into(),
+        }
+    }
+
+    /// After a change made in the calendar, `before` the list as it was: what
+    /// left it stays, faint, and the note says where it went; a task added
+    /// on the day is picked, and one added elsewhere is said to be.
+    fn after_cal_change(&mut self, before: Vec<(Group, Ref)>, adding: bool) {
+        let mut said = Vec::new();
+        if adding {
+            let at = self.held(self.tasks.len() - 1);
+            let shown = self.entries().iter().position(|e| e.at == at);
+            match (shown, self.cal.as_mut()) {
+                (Some(n), Some(view)) => {
+                    if view.focus == Focus::Grid {
+                        view.focus = Focus::Day;
+                    }
+                    view.row = n;
+                }
+                _ => {
+                    let i = self.tasks.len() - 1;
+                    let id = self.tasks[i].id;
+                    said.push(match self.tasks[i].due {
+                        Some(due) => {
+                            format!("Added {id}, due {}.", day_words(due.date, self.today))
+                        }
+                        None => format!("Added {id}, with no date."),
+                    });
+                }
+            }
+        } else {
+            let fresh: Vec<Ref> = self.fresh_entries().iter().map(|&(_, r)| r).collect();
+            let mut left: Vec<Ref> = before
+                .iter()
+                .map(|&(_, r)| r)
+                .filter(|r| !fresh.contains(r))
+                .collect();
+            // Once each, a task listed in two groups too.
+            left.sort_unstable();
+            left.dedup();
+            for at in left {
+                if let Some(i) = self.find(at) {
+                    said.push(format!("{} is {} now.", at.id, self.whereabouts(i)));
+                }
+            }
+            if let Some(view) = self.cal.as_mut() {
+                view.kept = Some(before);
+            }
+        }
+        if !said.is_empty() {
+            let said = said.join(" ");
+            self.note = Some(match self.note.take() {
+                Some(note) => format!("{note} {said}"),
+                None => said,
+            });
+        }
+    }
+
+    /// Makes `op` to the tasks file at `path` as it is on disk now, and saves
+    /// it, under the file's lock (see [`store::update`]): a `halil add` from
+    /// another terminal meanwhile is read first, never written over.
+    pub fn save_change(&mut self, path: &Path, op: Op) {
+        let made = store::update(path, |fresh| {
+            self.replace_tasks(std::mem::take(fresh));
+            self.apply(op);
+            fresh.clone_from(&self.tasks);
+            Ok(((), true))
+        });
+        if let Err(e) = made {
+            self.message = Some(e);
         }
     }
 
@@ -414,8 +865,11 @@ impl Board {
     /// Keeps the folds in their file beside the tasks file at `path`, when
     /// they changed.
     pub fn keep_folds(&mut self, path: &Path) {
+        // Under the tasks file's lock: two boards keeping folds at once each
+        // write theirs whole, one after the other.
         if std::mem::take(&mut self.folds_changed)
-            && let Err(e) = save_folds(&folds_path(path), &self.folded)
+            && let Err(e) =
+                store::lock(path).and_then(|_held| save_folds(&folds_path(path), &self.folded))
         {
             self.message = Some(e);
         }
@@ -504,6 +958,7 @@ impl Board {
     fn cards(&self, c: usize, parents: &[Option<usize>]) -> Vec<usize> {
         let mut ids: Vec<usize> = (0..self.tasks.len())
             .filter(|&i| parents[i].is_none() && self.tasks[i].status == COLUMNS[c])
+            .filter(|&i| self.shown(i, parents))
             .collect();
         if COLUMNS[c] == Status::Done {
             ids.sort_by_key(|&i| (Reverse(self.tasks[i].priority), self.tasks[i].id));
@@ -521,6 +976,9 @@ impl Board {
 
     /// The picked card or sub item, as an index into `tasks`.
     fn picked(&self) -> Option<usize> {
+        if self.cal.is_some() {
+            return self.cal_picked();
+        }
         self.column(self.col).get(self.row).copied()
     }
 
@@ -596,6 +1054,13 @@ impl Board {
     /// folded: folded into its count, out of sight, they're no rows for a key
     /// to act on.
     fn keep_marks_in_sight(&mut self) {
+        // In the calendar, every task is a row of its own.
+        if self.cal.is_some() {
+            let there: BTreeSet<Ref> = (0..self.tasks.len()).map(|i| self.held(i)).collect();
+            self.marked
+                .retain(|&id, &mut stamp| there.contains(&Ref { id, stamp }));
+            return;
+        }
         let parents = task::parents(&self.tasks);
         let in_sight: BTreeSet<Ref> = (0..self.tasks.len())
             .filter(|&i| {
@@ -609,10 +1074,35 @@ impl Board {
     }
 
     pub fn apply(&mut self, op: Op) {
+        let now = self.when();
+        // In the calendar, the list as it was: what the change takes off it
+        // stays, faint, until the pick moves.
+        let before: Option<Vec<(Group, Ref)>> = self
+            .cal
+            .as_ref()
+            .map(|_| self.entries().iter().map(|e| (e.group, e.at)).collect());
+        let adding = matches!(op, Op::Add { .. });
+        // What the notes say after: a done repeat opened again, and a moved
+        // date that kept its step.
+        let reopening: Vec<(Ref, String)> = (0..self.tasks.len())
+            .filter_map(|i| task::reopened_said(&self.tasks, i).map(|s| (self.held(i), s)))
+            .collect();
+        // Under a filter, what's shown: what the change takes out of it stays,
+        // faint, until the filter changes.
+        let filter_shown: Vec<Ref> = match &self.filter {
+            Some(_) => {
+                let parents = task::parents(&self.tasks);
+                (0..self.tasks.len())
+                    .filter(|&i| self.shown(i, &parents))
+                    .map(|i| self.held(i))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
         match op {
             Op::Move { at, to, follow } => {
                 if let Some(i) = self.find(at) {
-                    self.tasks[i].status = to;
+                    task::set_status(&mut self.tasks[i], to, &now);
                     if to == Status::Done {
                         self.finish_sub_items(&[at.id]);
                     }
@@ -629,7 +1119,7 @@ impl Board {
                 let parents = task::parents(&self.tasks);
                 for (task, parent) in self.tasks.iter_mut().zip(parents) {
                     if parent.is_none() && ids.contains(&task.id) {
-                        task.status = to;
+                        task::set_status(task, to, &now);
                     }
                 }
                 // As `d`: the pick stays on its row, the next card under it.
@@ -674,7 +1164,7 @@ impl Board {
                         && ids.contains(&task.id)
                         && let Some(to) = shifted(task.status, by)
                     {
-                        task.status = to;
+                        task::set_status(task, to, &now);
                         if to == Status::Done {
                             into_done.push(task.id);
                         }
@@ -689,7 +1179,7 @@ impl Board {
                 let ids = self.still_there(&refs);
                 let picked = self.picked_ref();
                 for task in self.tasks.iter_mut().filter(|t| ids.contains(&t.id)) {
-                    task.status = Status::Done;
+                    task::set_status(task, Status::Done, &now);
                 }
                 self.finish_sub_items(&ids);
                 if let Some(at) = picked {
@@ -736,14 +1226,63 @@ impl Board {
                     due: parsed.due,
                     parent,
                     stamp,
+                    done: None,
+                    added: Some(Local::of(&now)),
+                    every: parsed.every,
+                    next: None,
                 });
                 self.pick(id);
             }
+        }
+        // A repeating task done: its next one, said.
+        let rolled = task::roll_repeats(&mut self.tasks, &now);
+        let mut said = Vec::new();
+        if let Some(next) = task::next_said(&rolled, self.today) {
+            said.push(match self.note.take() {
+                // `Done, with its 2 open sub items.`, then when it's next.
+                Some(note) => format!("{note} {}", next.trim_start_matches("Done. ")),
+                None => next,
+            });
+        }
+        for (at, reopened) in reopening {
+            if self
+                .find(at)
+                .is_some_and(|i| self.tasks[i].status != Status::Done)
+            {
+                said.push(reopened);
+            }
+        }
+        if let Some(kept) = self.filter.clone() {
+            let parents = task::parents(&self.tasks);
+            let added = adding.then(|| self.held(self.tasks.len() - 1));
+            let mut left = false;
+            for at in filter_shown.into_iter().chain(added) {
+                if let Some(i) = self.find(at)
+                    && !kept.shows(&self.tasks, &parents, i, self.today)
+                    && self.filter_faint.insert(at)
+                {
+                    left = true;
+                }
+            }
+            // The faint card is what it's about: no number to read.
+            if left {
+                said.push(format!("No longer matches {}.", kept.text));
+            }
+        }
+        if !said.is_empty() {
+            let said = said.join(" ");
+            self.note = Some(match self.note.take() {
+                Some(note) => format!("{note} {said}"),
+                None => said,
+            });
         }
         // A card gone to Done (d, l, a marked l) folds its sub items away.
         self.keep_folds_in_sight();
         self.keep_marks_in_sight();
         self.clamp();
+        if let Some(before) = before {
+            self.after_cal_change(before, adding);
+        }
     }
 
     /// `z`: folds the picked card's sub items away, or unfolds them; on a sub
@@ -819,6 +1358,7 @@ impl Board {
     /// their card is now done, and says how many in a note.
     fn finish_sub_items(&mut self, ids: &[u32]) {
         let parents = task::parents(&self.tasks);
+        let now = self.when();
         let mut cards = BTreeSet::new();
         let mut n = 0;
         for (i, parent) in parents.into_iter().enumerate() {
@@ -826,7 +1366,7 @@ impl Board {
                 && ids.contains(&self.tasks[p].id)
                 && self.tasks[i].status != Status::Done
             {
-                self.tasks[i].status = Status::Done;
+                task::set_status(&mut self.tasks[i], Status::Done, &now);
                 cards.insert(p);
                 n += 1;
             }
@@ -891,6 +1431,11 @@ impl Board {
         if let Some(removal) = self.asking.take() {
             return self.answer(removal, key);
         }
+        if self.cal.is_some()
+            && let Some(outcome) = self.cal_key(key)
+        {
+            return outcome;
+        }
         let last = self.column(self.col).len().saturating_sub(1);
         match key.code {
             KeyCode::Char('c') if ctrl => return Outcome::Quit,
@@ -899,11 +1444,15 @@ impl Board {
             KeyCode::Char(_) if ctrl => {}
             KeyCode::Char('q') => return Outcome::Quit,
             KeyCode::Esc => {
-                if self.marked.is_empty() {
+                if !self.marked.is_empty() {
+                    self.marked.clear();
+                } else if self.filter.is_some() {
+                    self.clear_filter();
+                } else {
                     return Outcome::Quit;
                 }
-                self.marked.clear();
             }
+            KeyCode::Char('/') => self.open_filter(),
             KeyCode::Char(' ') => {
                 if let Some(i) = self.picked() {
                     let Ref { id, stamp } = self.held(i);
@@ -929,6 +1478,7 @@ impl Board {
             KeyCode::Char('x') | KeyCode::Delete => self.ask_removal(),
             KeyCode::Char('y') => return self.copy(),
             KeyCode::Char('z') => self.fold(),
+            KeyCode::Char('c') => self.open_cal(true),
             KeyCode::Char('a') => self.input = Some(Input::new(InputKind::Add, String::new())),
             KeyCode::Char('A') => {
                 if let Some(i) = self.picked() {
@@ -972,11 +1522,22 @@ impl Board {
                 .map(|i| self.tasks[i].title.as_str())
                 .into_iter()
                 .collect(),
-            false => (0..COLUMNS.len())
-                .flat_map(|c| self.column(c))
-                .filter(|&i| self.is_marked(i))
-                .map(|i| self.tasks[i].title.as_str())
-                .collect(),
+            false => {
+                // The board's order; then, marked in the calendar, a sub
+                // item the board folds away, by id.
+                let mut order: Vec<usize> =
+                    (0..COLUMNS.len()).flat_map(|c| self.column(c)).collect();
+                let mut rest: Vec<usize> = (0..self.tasks.len())
+                    .filter(|i| !order.contains(i))
+                    .collect();
+                rest.sort_by_key(|&i| self.tasks[i].id);
+                order.extend(rest);
+                order
+                    .into_iter()
+                    .filter(|&i| self.is_marked(i))
+                    .map(|i| self.tasks[i].title.as_str())
+                    .collect()
+            }
         };
         let what = match titles[..] {
             [] => return Outcome::Nothing,
@@ -1142,14 +1703,14 @@ impl Board {
             self.message = Some(WITH_ITS_TASK.into());
             return Outcome::Nothing;
         }
+        // By its own column: in the calendar, the board's isn't where it is.
         let to = self
-            .col
-            .checked_add_signed(by)
-            .filter(|&c| c < COLUMNS.len());
+            .picked()
+            .and_then(|i| shifted(self.tasks[i].status, by));
         match (self.picked(), to) {
             (Some(i), Some(to)) => Outcome::Change(Op::Move {
                 at: self.held(i),
-                to: COLUMNS[to],
+                to,
                 follow: true,
             }),
             _ => Outcome::Nothing,
@@ -1197,6 +1758,20 @@ impl Board {
         }
     }
 
+    /// The time a change is made at, with the zone halil runs in: now, or
+    /// noon on the board's day when that isn't today (a test's day).
+    fn when(&self) -> Zoned {
+        let now = Zoned::now();
+        match now.date() == self.today {
+            true => now,
+            false => self
+                .today
+                .at(12, 0, 0, 0)
+                .to_zoned(now.time_zone().clone())
+                .unwrap_or(now),
+        }
+    }
+
     /// The date of the task an `e` is typing for, if it has one.
     fn editing_due(&self) -> Option<Due> {
         match self.input.as_ref()?.kind {
@@ -1212,6 +1787,17 @@ impl Board {
             return Outcome::Nothing;
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let filtering = input.kind == InputKind::Filter;
+        // The filter line: enter keeps it, esc drops it (the one kept before
+        // comes back).
+        if filtering {
+            match key.code {
+                KeyCode::Enter => return self.keep_filter(),
+                KeyCode::Esc => return self.drop_typed_filter(),
+                KeyCode::Char('c') if ctrl => return self.drop_typed_filter(),
+                _ => {}
+            }
+        }
         // While the calendar is up, the arrows and the page keys are its, and
         // esc closes it, the words left as they are.
         if input.cal.is_some() && cal_room && !ctrl {
@@ -1254,8 +1840,9 @@ impl Board {
                 input.text.insert(input.cursor, c);
                 input.edited(input.cursor..input.cursor, c.len_utf8());
                 input.cursor += c.len_utf8();
-                // The second `/` of a `//` opens the calendar under it.
-                if c == '/' && input.text[..input.cursor].ends_with("//") {
+                // The second `/` of a `//` opens the calendar under it; not
+                // in the filter line, where `by` and `late` aren't days.
+                if c == '/' && !filtering && input.text[..input.cursor].ends_with("//") {
                     input.cal = Some(Cal {
                         at: input.cursor - 2,
                     });
@@ -1276,7 +1863,48 @@ impl Board {
             }
             _ => {}
         }
+        if filtering {
+            self.filter_typed();
+        }
         Outcome::Nothing
+    }
+
+    /// Enter on the filter line: the filter kept, the keys the board's again;
+    /// a `//` or `!` that doesn't read, refused, the words kept.
+    fn keep_filter(&mut self) -> Outcome {
+        let text = self
+            .input
+            .as_ref()
+            .map(|i| i.text.clone())
+            .unwrap_or_default();
+        match filter::read(&text, self.now()) {
+            Ok(kept) => {
+                let before = self.board_pick();
+                self.input = None;
+                self.filter_was = None;
+                self.filter = (!kept.is_empty()).then_some(kept);
+                self.refilter(before);
+            }
+            Err(e) => self.message = Some(e),
+        }
+        Outcome::Nothing
+    }
+
+    /// Esc on the filter line: what was typed dropped, the filter kept
+    /// before back.
+    fn drop_typed_filter(&mut self) -> Outcome {
+        let before = self.board_pick();
+        self.input = None;
+        self.filter = self.filter_was.take().flatten();
+        self.refilter(before);
+        Outcome::Nothing
+    }
+
+    /// Esc on the board with a filter kept: cleared, the pick kept.
+    fn clear_filter(&mut self) {
+        let before = self.board_pick();
+        self.filter = None;
+        self.refilter(before);
     }
 
     /// Enter on the input: the change its words ask for, or why they can't be
@@ -1293,6 +1921,10 @@ impl Board {
                 _ => None,
             };
             return match parse::parse(words, now) {
+                Ok(task) if parent.is_some() && task.every.is_some() => {
+                    self.message = Some(crate::REPEATS_WITH_ITS_CARD.into());
+                    Outcome::Nothing
+                }
                 Ok(task) => {
                     self.input = None;
                     Outcome::Change(Op::Add { task, parent })
@@ -1333,12 +1965,19 @@ impl Board {
                 .split_whitespace()
                 .any(|w| w.strip_prefix('-').is_some_and(|w| w.to_lowercase() == tag))
         };
+        let repeats = tasks.iter().any(|t| t.every.is_some());
         let read = |keep_title_words: bool| {
-            parse::change(words, now, |tag| {
-                tasks.iter().any(|t| {
-                    t.tags.iter().any(|own| own == tag) && !(keep_title_words && in_title(t, tag))
-                })
-            })
+            parse::change(
+                words,
+                now,
+                |tag| {
+                    tasks.iter().any(|t| {
+                        t.tags.iter().any(|own| own == tag)
+                            && !(keep_title_words && in_title(t, tag))
+                    })
+                },
+                repeats,
+            )
         };
         let change = match kind {
             InputKind::Edit(Ref { id, .. }) => {
@@ -1370,6 +2009,9 @@ impl Board {
             change.apply(&mut changed);
             changed != *t
         });
+        // A repeat the words left on is said, the line changing anything else
+        // or not.
+        self.note = tasks.iter().find_map(|&t| crate::still_said(&change, t));
         self.input = None;
         match changes {
             true => Outcome::Change(Op::Edit { refs, change }),
@@ -1380,14 +2022,33 @@ impl Board {
     /// The screen, `w` by `h`, as one line a row, and where the cursor goes
     /// (while typing a task).
     fn draw(&mut self, w: usize, h: usize) -> (Vec<Line>, Option<(u16, u16)>) {
-        let col_w = w.saturating_sub(2 * MARGIN + (COLUMNS.len() - 1) * GAP) / COLUMNS.len();
-        if col_w < 12 || h < 7 {
+        let body = match self.cal.is_some() {
+            true => self.draw_cal(w, h),
+            false => self.draw_board(w, h),
+        };
+        let Some(mut lines) = body else {
+            let what = if self.cal.is_some() {
+                "calendar"
+            } else {
+                "board"
+            };
             let mut row = Row::default();
             row.push(
-                &truncate("  Make the window larger for the board", w),
+                &truncate(&format!("  Make the window larger for the {what}"), w),
                 Style::fg(QUIET),
             );
             return (vec![row.spans], None);
+        };
+        let parents = task::parents(&self.tasks);
+        self.draw_bottom(&mut lines, &parents, w, h)
+    }
+
+    /// The board's rows above the row above the footer: none when the screen
+    /// is too small for it.
+    fn draw_board(&mut self, w: usize, h: usize) -> Option<Vec<Line>> {
+        let col_w = w.saturating_sub(2 * MARGIN + (COLUMNS.len() - 1) * GAP) / COLUMNS.len();
+        if col_w < 12 || h < 7 {
+            return None;
         }
         let body_h = h - 5;
         let columns: Vec<Vec<usize>> = (0..COLUMNS.len()).map(|c| self.column(c)).collect();
@@ -1401,7 +2062,7 @@ impl Board {
         let mut cells: Vec<Vec<Row>> = Vec::new();
         let mut over: Option<(usize, usize, Vec<Row>)> = None;
         for (c, rows) in columns.iter().enumerate() {
-            let drawn = |n: usize| {
+            let drawn_whole = |n: usize| {
                 let i = rows[n];
                 let look = Look {
                     width: col_w,
@@ -1436,6 +2097,15 @@ impl Board {
                     };
                     card(&shown, count.as_deref(), look)
                 }
+            };
+            // A change took it out of the filter: faint, until the filter
+            // changes.
+            let drawn = |n: usize| {
+                let mut rows_drawn = drawn_whole(n);
+                if self.faint_under_filter(rows[n]) {
+                    faint(&mut rows_drawn);
+                }
+                rows_drawn
             };
             // The picked column scrolls to keep the pick in view; another
             // stays where it was, as far as its rows go.
@@ -1489,7 +2159,7 @@ impl Board {
                 let mut cell = Row::default();
                 if let Some(line) = cells[c].get(r) {
                     cell = line.clone();
-                } else if r == 0 && cards.is_empty() {
+                } else if r == 0 && cards.is_empty() && self.filter.is_none() {
                     cell.push(
                         "   Nothing here",
                         Style {
@@ -1512,6 +2182,251 @@ impl Board {
                 }
             }
         }
+        // A filter that shows nothing anywhere says so, mid-board.
+        if self.filter.is_some() && columns.iter().all(Vec::is_empty) {
+            let said = "Nothing matches";
+            let mut row = Row::default();
+            row.pad_to(w.saturating_sub(said.width()) / 2, Style::default());
+            row.push(
+                said,
+                Style {
+                    italic: true,
+                    ..Style::fg(QUIETER)
+                },
+            );
+            lines[3 + body_h / 2] = row.spans;
+        }
+        Some(lines)
+    }
+
+    /// The calendar's rows above the row above the footer: the heading, the
+    /// month or the picked day's week, the date-not-known row, and the list
+    /// under them; none when the screen is too small for it.
+    fn draw_cal(&mut self, w: usize, h: usize) -> Option<Vec<Line>> {
+        let view = self.cal.clone()?;
+        // Under a filter, every count is of what it shows.
+        let visible = self.visible();
+        let counts = cal::counts(&visible);
+        let on = |d: Date| counts.get(&d).copied().unwrap_or_default();
+        let weeks = cal::weeks(view.day);
+        let month: Vec<cal::Counts> = weeks.iter().flatten().flatten().map(|&d| on(d)).collect();
+        let week = cal::week_of(view.day);
+        let week_counts: Vec<cal::Counts> = week.iter().map(|&d| on(d)).collect();
+        let shape = cal::shape(&month, &week_counts, w, h)?;
+        let form = shape.form();
+        let cw = cal::cell_width(w);
+        let today = self.today;
+        let mut lines: Vec<Line> = Vec::new();
+
+        let mut heading = Row::default();
+        for (x, text, legend) in cal::heading(view.day, form, cw) {
+            heading.pad_to(x, Style::default());
+            let style = if legend {
+                Style::fg(QUIET)
+            } else {
+                Style::default()
+            };
+            heading.push(&text, style);
+        }
+        lines.push(heading.spans);
+
+        // A day's cell: its head at the right (the day, or `We 25`), then its
+        // counts; picked, on the picked row's ground; today's head in blue;
+        // due in amber, red once the day is gone; done quiet.
+        let cell = |date: Date, head: &str| -> Vec<Row> {
+            let picked = date == view.day;
+            let ground = Style {
+                bg: picked.then_some(HIGHLIGHT),
+                ..Style::default()
+            };
+            let head_fg = match (picked, date == today) {
+                (true, _) => Some(ON_HIGHLIGHT),
+                (false, true) => Some(BLUE),
+                (false, false) => None,
+            };
+            let mut top = Row::default();
+            top.pad_to(cw.saturating_sub(head.width()), ground);
+            top.push(
+                head,
+                Style {
+                    fg: head_fg,
+                    bold: picked,
+                    ..ground
+                },
+            );
+            let mut rows = vec![top];
+            for line in cal::say(on(date), form, cw) {
+                let mut row = Row::default();
+                row.pad_to(cw.saturating_sub(cal::plain(&line).width()), ground);
+                for (part, text) in &line {
+                    let fg = match part {
+                        cal::Part::Due if date < today => RED,
+                        cal::Part::Due => AMBER,
+                        cal::Part::Done | cal::Part::Between => QUIET,
+                    };
+                    row.push(
+                        text,
+                        Style {
+                            fg: Some(fg),
+                            ..ground
+                        },
+                    );
+                }
+                rows.push(row);
+            }
+            for row in &mut rows {
+                row.pad_to(cw, ground);
+            }
+            rows
+        };
+        let push_week = |lines: &mut Vec<Line>, days: [Option<(Date, String)>; 7]| {
+            let mut rows = vec![Row::default(); 1 + form.lines()];
+            for (d, day) in days.iter().enumerate() {
+                let Some((date, head)) = day else {
+                    continue;
+                };
+                for (row, part) in rows.iter_mut().zip(cell(*date, head)) {
+                    row.pad_to(cal::cell_x(d, cw), Style::default());
+                    row.append(&part);
+                }
+            }
+            lines.extend(rows.into_iter().map(|r| r.spans));
+        };
+        match shape {
+            cal::Shape::Month(_) => {
+                let mut names = Row::default();
+                for (d, name) in ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"]
+                    .iter()
+                    .enumerate()
+                {
+                    names.pad_to(cal::cell_x(d, cw), Style::default());
+                    names.push(&format!("{name:>cw$}"), Style::fg(QUIETER));
+                }
+                lines.push(names.spans);
+                for days in weeks {
+                    push_week(
+                        &mut lines,
+                        days.map(|d| d.map(|d| (d, format!("{:>2}", d.day())))),
+                    );
+                }
+            }
+            cal::Shape::Week(_) => {
+                push_week(&mut lines, week.map(|d| Some((d, cal::strip_head(d, cw)))));
+            }
+        }
+
+        // What has no date, in one place, always in sight.
+        if let Some(said) = cal::not_known_line(&visible) {
+            let style = match view.focus {
+                Focus::Unknown => Style {
+                    fg: Some(ON_HIGHLIGHT),
+                    bg: Some(HIGHLIGHT),
+                    ..Style::default()
+                },
+                _ => Style::fg(QUIET),
+            };
+            let mut row = Row::default();
+            row.pad_to(MARGIN - 1, Style::default());
+            row.push(&truncate(&format!(" {said} "), w - MARGIN), style);
+            lines.push(row.spans);
+        }
+
+        // The list: its group's name on the first of each, then the task as
+        // a card is drawn, a sub item with its card's title after it.
+        let room = (h - 2).saturating_sub(lines.len());
+        let entries = self.entries();
+        let label_w = 6;
+        let list_w = w.saturating_sub(MARGIN + label_w + MARGIN);
+        let parents = task::parents(&self.tasks);
+        let row = view.row.min(entries.len().saturating_sub(1));
+        let listing = view.focus != Focus::Grid;
+        let drawn: Vec<Vec<Row>> = entries
+            .iter()
+            .enumerate()
+            .map(|(n, e)| {
+                let Some(i) = self.find(e.at) else {
+                    return vec![Row::default()];
+                };
+                let look = Look {
+                    width: list_w,
+                    room: list_w,
+                    picked: listing && n == row,
+                    marked: self.is_marked(i),
+                    today,
+                    late_count: false,
+                };
+                // Its card's title, where its own stays whole beside it and a
+                // date's words.
+                let under = parents[i]
+                    .map(|p| format!("under {}", truncate(&self.tasks[p].title, 24)))
+                    .filter(|u| {
+                        self.tasks[i].title.width() + 2 + u.width() + 12 <= list_w.saturating_sub(4)
+                    });
+                let mut rows = card(&self.tasks[i], under.as_deref(), look);
+                if e.faint || self.faint_under_filter(i) {
+                    faint(&mut rows);
+                }
+                rows
+            })
+            .collect();
+        let tall = |n: usize| drawn[n].len();
+        let mut scroll = view.scroll.min(row);
+        while scroll < row && (scroll..=row).map(tall).sum::<usize>() > room {
+            scroll += 1;
+        }
+        let mut listed = Vec::new();
+        'entries: for n in scroll..entries.len() {
+            for (j, part) in drawn[n].iter().enumerate() {
+                if listed.len() == room {
+                    break 'entries;
+                }
+                let first = j == 0 && (n == scroll || entries[n - 1].group != entries[n].group);
+                let label = if first { entries[n].group.name() } else { "" };
+                let mut line = Row::default();
+                line.pad_to(MARGIN, Style::default());
+                line.push(&format!("{label:<label_w$}"), Style::fg(QUIET));
+                line.append(part);
+                listed.push(line.spans);
+            }
+        }
+        if entries.is_empty() && room > 0 {
+            let mut line = Row::default();
+            line.pad_to(MARGIN, Style::default());
+            line.push(
+                &truncate(
+                    &format!(
+                        "Nothing due, done or added on {}",
+                        day_words(view.day, today)
+                    ),
+                    w - MARGIN,
+                ),
+                Style {
+                    italic: true,
+                    ..Style::fg(QUIETER)
+                },
+            );
+            listed.push(line.spans);
+        }
+        lines.extend(listed);
+        lines.resize(h - 2, Line::new());
+        if let Some(view) = self.cal.as_mut() {
+            view.scroll = scroll;
+            view.row = row;
+        }
+        Some(lines)
+    }
+
+    /// The row above the footer, the footer, and the `//` calendar over them
+    /// while it's up, after `lines`, the rows above them: the whole screen,
+    /// and where the cursor goes.
+    fn draw_bottom(
+        &mut self,
+        lines: &mut Vec<Line>,
+        parents: &[Option<usize>],
+        w: usize,
+        h: usize,
+    ) -> (Vec<Line>, Option<(u16, u16)>) {
+        let mut lines = std::mem::take(lines);
 
         // A refusal in red, then a note of what was done in the terminal's
         // own colour, three cells after it, and how a Hangul letter was read.
@@ -1549,6 +2464,16 @@ impl Board {
         let mut cursor = None;
         // The calendar's `//`, where it's drawn in the footer.
         let mut cal_x = None;
+        // A kept filter, always in sight where the typing line is: the keys
+        // give way before it does.
+        let filter_said = self.filter.as_ref().map(|f| {
+            let (n, m) = self.filter_count();
+            format!("  / {} · {n} of {m} ", f.text)
+        });
+        let filtered = filter_said.is_some();
+        if let (Some(said), None, None) = (&filter_said, &self.input, &self.asking) {
+            footer.push(&truncate(said, w), Style::default());
+        }
         match &self.input {
             Some(input) => {
                 let (label, hint, example) = match input.kind {
@@ -1572,9 +2497,33 @@ impl Board {
                         "enter to change · esc to cancel",
                         "//fri 6pm +tag -tag !high",
                     ),
+                    InputKind::Filter => (
+                        "/".to_string(),
+                        "//fri  //by fri  //late",
+                        "words +tag !high",
+                    ),
                 };
                 footer.push(&format!("  {label}  "), Style::fg(QUIET));
-                let room = w.saturating_sub(footer.width + hint.width() + 4);
+                // The hint gives way to what's typed, so the line's end stays
+                // in sight: its last part first (`esc to cancel`), then the rest.
+                let typed_w = match input.text.is_empty() {
+                    true => 0,
+                    false => input.text.width() + 1,
+                };
+                let parts: Vec<&str> = hint.split(" · ").collect();
+                let hint = (0..=parts.len())
+                    .rev()
+                    .map(|n| parts[..n].join(" · "))
+                    .find(|h| {
+                        let gap = if h.is_empty() { 0 } else { 4 };
+                        footer.width + typed_w + h.width() + gap <= w
+                    })
+                    .unwrap_or_default();
+                let hint = hint.as_str();
+                let room = match hint.is_empty() {
+                    true => w.saturating_sub(footer.width + 1),
+                    false => w.saturating_sub(footer.width + hint.width() + 4),
+                };
                 let start = footer.width;
                 let mut at = 0;
                 if input.text.is_empty() {
@@ -1647,11 +2596,76 @@ impl Board {
                     footer.push(&format!(" {what}"), Style::fg(QUIETER));
                 }
             }
+            None if self.cal.is_some() => {
+                // The calendar's keys: the moves while no task is picked, else
+                // the keys that act on it, as the board's footer gives them.
+                if !filtered {
+                    footer.push(" ", Style::default());
+                }
+                let mut hints: Vec<(&str, &str, Option<u8>)> = match self.picked() {
+                    None => vec![
+                        // The way back, right after the moves and tab, at
+                        // every width: a first look always sees it.
+                        ("←→", "day", None),
+                        ("↑↓", "week", Some(10)),
+                        ("pgup pgdn", "month", Some(3)),
+                        ("tab", "list", Some(9)),
+                        ("c", "board", Some(8)),
+                        ("/", "filter", Some(7)),
+                        ("T", "today", Some(6)),
+                        ("a", "add", Some(5)),
+                        ("q", "quit", Some(2)),
+                    ],
+                    Some(i) => {
+                        let sub = parents[i].is_some();
+                        let status = self.tasks[i].status;
+                        // As the board's, but the way back, which gives way
+                        // last; and on a done task no `d`: it's done, and the
+                        // moves (`h l`, `t`, `s`) open it again.
+                        // The board's order (see `board_hints`), `c` the way
+                        // back to it.
+                        let mut hints = vec![
+                            ("j k", "pick", Some(RANK_J_K)),
+                            ("space", "mark", Some(RANK_SPACE)),
+                            ("h l", "move", None),
+                            ("t", "todo", Some(RANK_S_T)),
+                            ("s", "doing", Some(RANK_S_T)),
+                            ("d", "done", None),
+                            ("tab", "next", Some(RANK_TAB)),
+                            ("c", "board", Some(RANK_C)),
+                            ("/", "filter", Some(RANK_FILTER)),
+                            ("a", "add", None),
+                            ("A", "sub", Some(RANK_A)),
+                            ("e", "edit", None),
+                            ("y", "copy", Some(RANK_Y)),
+                            ("x", "remove", Some(RANK_X)),
+                            ("q", "quit", Some(RANK_Q)),
+                        ];
+                        hints.retain(|&(keys, _, _)| match keys {
+                            "h l" | "t" | "s" if sub => false,
+                            "t" => status != Status::Todo,
+                            "s" => status != Status::Doing,
+                            "d" => status != Status::Done,
+                            _ => true,
+                        });
+                        hints
+                    }
+                };
+                if filtered {
+                    hints.retain(|&(keys, _, _)| keys != "/");
+                }
+                for (keys, what) in
+                    hints_with_clear(&hints, w.saturating_sub(footer.width), filtered)
+                {
+                    footer.push(&format!(" {keys} "), Style::fg(QUIET));
+                    footer.push(&format!("{what} "), Style::fg(QUIETER));
+                }
+            }
             None => {
                 // When they don't all fit, the keys give way by need: `tab`
                 // first (the arrows go between columns too), then `q` (`esc`
-                // quits too), then `j k`, then `t`, `x` and `s`, and only then
-                // the rest. `d` goes last, and its word for what it does to
+                // quits too), then `j k`, then `t` and `x`, then `c`, then `s`,
+                // and only then the rest. `d` goes last, and its word for what it does to
                 // the picked row with it.
                 let sub = self.picked().is_some_and(|i| parents[i].is_some());
                 // `z` where it acts: on a card with sub items, or one of
@@ -1661,29 +2675,20 @@ impl Board {
                     .map(|i| parents[i].unwrap_or(i))
                     .filter(|&card| {
                         COLUMNS[self.col] != Status::Done
-                            && !task::sub_items(&self.tasks, &parents, card).is_empty()
+                            && !task::sub_items(&self.tasks, parents, card).is_empty()
                     });
                 let fold = match folds.map(|card| self.is_folded(card)) {
                     Some(true) => "unfold",
                     _ => "fold",
                 };
-                footer.push(" ", Style::default());
-                let mut hints = vec![
-                    ("j k", "pick", Some(4)),
-                    ("space", "mark", Some(10)),
-                    ("h l", "move", Some(13)),
-                    ("t", "todo", Some(5)),
-                    ("s", "doing", Some(7)),
-                    ("d", if sub { "done/open" } else { "done" }, None),
-                    ("tab", "column", Some(1)),
-                    ("a", "add", Some(12)),
-                    ("A", "sub", Some(9)),
-                    ("e", "edit", Some(11)),
-                    ("z", fold, Some(8)),
-                    ("y", "copy", Some(2)),
-                    ("x", "remove", Some(6)),
-                    ("q", "quit", Some(3)),
-                ];
+                if !filtered {
+                    footer.push(" ", Style::default());
+                }
+                let mut hints = board_hints(sub, fold);
+                // With a filter kept, its line says `/`.
+                if filtered {
+                    hints.retain(|&(keys, _, _)| keys != "/");
+                }
                 // Only the keys that act on what's picked: not the key to the
                 // column it's in (in Done, `d` moves it back to Todo, as `t`
                 // says), and none that moves it on a sub item, which moves
@@ -1696,7 +2701,9 @@ impl Board {
                     "z" => folds.is_some(),
                     _ => true,
                 });
-                for (keys, what) in giving_way(&hints, w.saturating_sub(footer.width), 3) {
+                for (keys, what) in
+                    hints_with_clear(&hints, w.saturating_sub(footer.width), filtered)
+                {
                     footer.push(&format!(" {keys} "), Style::fg(QUIET));
                     footer.push(&format!("{what} "), Style::fg(QUIETER));
                 }
@@ -1775,18 +2782,12 @@ fn calendar(day: Option<Date>, today: Date, due: &BTreeSet<Date>, width: usize) 
     side(&mut row, days);
     rows.push(row);
 
-    let lead = first.weekday().to_sunday_zero_offset() as usize;
-    for week in 0..6 {
+    for days in cal::weeks(first) {
         let mut inside = Row::default();
-        for d in 0..7 {
+        for (d, date) in days.into_iter().enumerate() {
             if d > 0 {
                 inside.push(" ", Style::default());
             }
-            let n = (week * 7 + d) as i64 - lead as i64 + 1;
-            let date = (1..=i64::from(first.days_in_month()))
-                .contains(&n)
-                .then(|| first.with().day(n as i8).build().ok())
-                .flatten();
             let Some(date) = date else {
                 inside.push("  ", Style::default());
                 continue;
@@ -1830,6 +2831,63 @@ fn calendar(day: Option<Date>, today: Date, due: &BTreeSet<Date>, width: usize) 
     bottom.push("╯", frame);
     rows.push(bottom);
     rows
+}
+
+// The footer's order of giving way, first to go first: `tab`, `y`, `q`, `j k`
+// (as since 0.3.0), `space`, the picked row's other column (`s`, `t`: `h l`
+// says it too), `z`, `A`, `x`, `/`, `c`. Never: `h l`, `d`, `a`, `e`.
+const RANK_TAB: u8 = 1;
+const RANK_Y: u8 = 2;
+const RANK_Q: u8 = 3;
+const RANK_J_K: u8 = 4;
+const RANK_SPACE: u8 = 5;
+const RANK_S_T: u8 = 6;
+const RANK_Z: u8 = 7;
+const RANK_A: u8 = 8;
+const RANK_X: u8 = 9;
+const RANK_FILTER: u8 = 10;
+const RANK_C: u8 = 11;
+
+/// The hints that fit `room`, as [`giving_way`] gives them, and with a
+/// filter kept, `esc clear` after them, its room taken first: it never goes.
+fn hints_with_clear<'a>(
+    hints: &[(&'a str, &'a str, Option<u8>)],
+    room: usize,
+    filtered: bool,
+) -> Vec<(&'a str, &'a str)> {
+    const CLEAR: (&str, &str) = ("esc", "clear");
+    match filtered {
+        false => giving_way(hints, room, 3),
+        true => {
+            let clear_w = 3 + CLEAR.0.width() + CLEAR.1.width();
+            let mut shown = giving_way(hints, room.saturating_sub(clear_w), 3);
+            shown.push(CLEAR);
+            shown
+        }
+    }
+}
+
+/// The board's key hints, in their order on the footer, each with its rank
+/// in giving way: a sub item picked (`sub`) or not, and `fold`'s word.
+fn board_hints(sub: bool, fold: &'static str) -> Vec<(&'static str, &'static str, Option<u8>)> {
+    vec![
+        ("j k", "pick", Some(RANK_J_K)),
+        ("space", "mark", Some(RANK_SPACE)),
+        ("h l", "move", None),
+        ("t", "todo", Some(RANK_S_T)),
+        ("s", "doing", Some(RANK_S_T)),
+        ("d", if sub { "done/open" } else { "done" }, None),
+        ("tab", "column", Some(RANK_TAB)),
+        ("a", "add", None),
+        ("A", "sub", Some(RANK_A)),
+        ("e", "edit", None),
+        ("z", fold, Some(RANK_Z)),
+        ("y", "copy", Some(RANK_Y)),
+        ("x", "remove", Some(RANK_X)),
+        ("q", "quit", Some(RANK_Q)),
+        ("c", "calendar", Some(RANK_C)),
+        ("/", "filter", Some(RANK_FILTER)),
+    ]
 }
 
 /// The footer's key hints that fit in `room` columns, in their order, each
@@ -1913,6 +2971,16 @@ fn overlay(line: &Line, x: usize, top: &Row, ground: Style) -> Line {
     before.pad_to(end, ground);
     before.append(&after);
     before.spans
+}
+
+/// `rows` drawn faint: what's left a list or a filter since, until the pick
+/// or the filter moves.
+fn faint(rows: &mut [Row]) {
+    for row in rows {
+        for span in &mut row.spans {
+            span.style.fg = Some(QUIETER);
+        }
+    }
 }
 
 /// The status a column left (-1) or right (1) of `s`, if there's one.
@@ -2009,61 +3077,123 @@ fn bar(row: &mut Row, marked: bool, plain: Style) {
     }
 }
 
-/// A task's due date in words, and whether it's late, when it's open and the
-/// words fit `inner` beside `taken` columns and 8 of title.
-fn due_fitting(task: &Task, today: Date, inner: usize, taken: usize) -> Option<(String, bool)> {
-    due_in_days(task, today)
-        .map(|days| (due_in_words(days), days < 0))
-        .filter(|(words, _)| words.width() + 2 + taken + 8 <= inner)
+/// A task's due date as a row says it: its words (`fri`, `2 days ago`),
+/// whether it's late, and how it repeats.
+#[derive(Debug, Clone)]
+struct DueWords {
+    words: String,
+    late: bool,
+    step: Step,
 }
 
-/// The due words at the right of a row, red when late.
-fn push_due(row: &mut Row, due: Option<(String, bool)>, plain: Style, quiet: Style) {
-    if let Some((words, overdue)) = due {
+/// A repeat as a row says it after the date: its words, faint (`weekly`),
+/// or `*` where the title is cut and there's no room for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    None,
+    Words(String),
+    Star,
+}
+
+impl DueWords {
+    fn width(&self) -> usize {
+        self.words.width()
+            + match &self.step {
+                Step::None => 0,
+                Step::Words(s) => 1 + s.width(),
+                Step::Star => 1,
+            }
+    }
+
+    /// The same, its step's words left to `*`.
+    fn starred(self) -> DueWords {
+        let step = match self.step {
+            Step::Words(_) => Step::Star,
+            step => step,
+        };
+        DueWords { step, ..self }
+    }
+}
+
+/// A task's due date in words, and whether it's late, when it's open and the
+/// words fit `inner` beside `taken` columns and 8 of title.
+fn due_fitting(task: &Task, today: Date, inner: usize, taken: usize) -> Option<DueWords> {
+    due_words(task, today).filter(|due| due.width() + 2 + taken + 8 <= inner)
+}
+
+/// The due words at the right of a row, red when late; its step's words
+/// after them, faint, or `*` in the date's own style.
+fn push_due(row: &mut Row, due: Option<DueWords>, plain: Style, quiet: Style) {
+    if let Some(due) = due {
         row.push("  ", plain);
-        let style = match overdue {
+        let style = match due.late {
             true => Style {
                 fg: Some(RED),
                 ..plain
             },
             false => quiet,
         };
-        row.push(&words, style);
+        row.push(&due.words, style);
+        match due.step {
+            Step::None => {}
+            Step::Words(words) => {
+                let faint = if plain.bg.is_some() { QUIET } else { QUIETER };
+                row.push(" ", plain);
+                row.push(
+                    &words,
+                    Style {
+                        fg: Some(faint),
+                        ..plain
+                    },
+                );
+            }
+            Step::Star => row.push("*", style),
+        }
     }
 }
 
 /// The width of a due date's words with the two spaces before them, or 0.
-fn due_width(due: &Option<(String, bool)>) -> usize {
-    due.as_ref().map_or(0, |(words, _)| words.width() + 2)
+fn due_width(due: &Option<DueWords>) -> usize {
+    due.as_ref().map_or(0, |due| due.width() + 2)
 }
 
 /// A due date that didn't fit at the right of the first row: at the right of
 /// the last, two cells after what's there, when it fits; else on a row of its
 /// own, at the right, under the rest of the picked row.
-fn place_late_due(
-    rows: &mut Vec<Row>,
-    due: (String, bool),
-    width: usize,
-    plain: Style,
-    quiet: Style,
-) {
+fn place_late_due(rows: &mut Vec<Row>, due: DueWords, width: usize, plain: Style, quiet: Style) {
     let last = rows.last_mut().expect("a row grown has its first line");
-    let words_w = due.0.width();
+    let words_w = due.width();
     if last.width + 2 + words_w < width {
         last.pad_to(width - 1 - words_w - 2, plain);
         push_due(last, Some(due), plain, quiet);
         return;
     }
-    let words = truncate(&due.0, width.saturating_sub(3));
+    // A row of its own; cut to fit when even that's short, its step first.
+    let due = match due.width() + 3 <= width {
+        true => due,
+        false => DueWords {
+            words: truncate(&due.words, width.saturating_sub(3)),
+            step: Step::None,
+            ..due
+        },
+    };
     let mut row = Row::default();
-    row.pad_to(width.saturating_sub(words.width() + 3), plain);
-    push_due(&mut row, Some((words, due.1)), plain, quiet);
+    row.pad_to(width.saturating_sub(due.width() + 3), plain);
+    push_due(&mut row, Some(due), plain, quiet);
     rows.push(row);
 }
 
-/// A task's due date in words, and whether it's late, while it's open.
-fn due_words(task: &Task, today: Date) -> Option<(String, bool)> {
-    due_in_days(task, today).map(|days| (due_in_words(days), days < 0))
+/// A task's due date in words, and whether it's late, while it's open; and
+/// how it repeats.
+fn due_words(task: &Task, today: Date) -> Option<DueWords> {
+    due_in_days(task, today).map(|days| DueWords {
+        words: due_in_words(days),
+        late: days < 0,
+        step: match task.every {
+            Some(every) => Step::Words(every.short()),
+            None => Step::None,
+        },
+    })
 }
 
 /// A card's first cells: a `▌` when it's marked, its priority mark, a space.
@@ -2107,7 +3237,16 @@ fn card(task: &Task, count: Option<&str>, look: Look) -> Vec<Row> {
     // Room inside the card: a space of padding at each end, the mark and its space.
     let inner = width.saturating_sub(4);
     let count_w = count.map_or(0, |c| c.width() + 2);
-    let due = due_fitting(task, today, inner, count_w);
+    // A repeat's words after the date where the title still fits whole
+    // beside them; else `*` (`fri*`), the picked row's overlay spelling them.
+    let fits = |due: &DueWords| due.width() + 2 + count_w + 8 <= inner;
+    let title_whole = |due: &DueWords| task.title.width() + count_w + due.width() + 2 <= inner;
+    let due = match due_words(task, today) {
+        Some(due) if due.step == Step::None => Some(due).filter(fits),
+        Some(due) if title_whole(&due) => Some(due),
+        Some(due) => Some(due.starred()).filter(fits),
+        None => None,
+    };
     let room = inner - due_width(&due);
     let tags = (!task.tags.is_empty()).then(|| {
         let tags: Vec<String> = task.tags.iter().map(|t| format!("+{t}")).collect();
@@ -2118,7 +3257,8 @@ fn card(task: &Task, count: Option<&str>, look: Look) -> Vec<Row> {
     let used = shown.width() + count_w;
     let whole = shown == task.title
         && tags.as_ref().is_none_or(|t| used + 2 + t.width() <= room)
-        && (due.is_some() || due_in_days(task, today).is_none());
+        && (due.is_some() || due_in_days(task, today).is_none())
+        && due.as_ref().is_none_or(|due| due.step != Step::Star);
     if picked && !whole {
         let mut head = Row::default();
         card_head(&mut head, task, marked, plain);
@@ -2159,7 +3299,7 @@ struct Whole<'a> {
     count: Option<&'a str>,
     count_style: Style,
     tags: Option<String>,
-    due: Option<(String, bool)>,
+    due: Option<DueWords>,
 }
 
 /// The picked row whole. On one line when it fits in the look's `room`, the
@@ -2219,9 +3359,7 @@ fn grow(
     let indent = head.width;
     let count_w = whole.count.map_or(0, |c| c.width() + 2);
     let (first_due, last_due) = match whole.due {
-        Some((words, late)) if words.width() + 2 + count_w + 8 <= inner => {
-            (Some((words, late)), None)
-        }
+        Some(due) if due.width() + 2 + count_w + 8 <= inner => (Some(due), None),
         due => (None, due),
     };
     let room = inner - due_width(&first_due);
@@ -2439,6 +3577,8 @@ enum InputKind {
     Sub(Ref),
     Edit(Ref),
     EditMarked,
+    /// `/`: the filter, the columns narrowing as it's typed.
+    Filter,
 }
 
 impl Input {
@@ -2483,9 +3623,22 @@ impl Input {
             date: day,
             time: from.and_then(|d| d.time),
         });
-        let span = parse::marked(&self.text, cal.at);
-        self.text.replace_range(span.clone(), &words);
+        // The date's words only: a typed `every …` after them stays, as a
+        // typed time does.
+        let span = parse::marked_date(&self.text, cal.at);
+        let step_after = span.is_empty() && !parse::marked(&self.text, cal.at).is_empty();
+        let put = match step_after {
+            true => format!("{words} "),
+            false => words.clone(),
+        };
+        self.text.replace_range(span.clone(), &put);
         self.cursor = span.start + words.len();
+        // A step on a weekday (`every fri`) follows the picked day, as the
+        // date's words do: the calendar never shows a day it won't be due.
+        if let Some(weekday) = parse::marked_step_weekday(&self.text, cal.at) {
+            let named = day.strftime("%a").to_string().to_lowercase();
+            self.text.replace_range(weekday, &named);
+        }
     }
 
     /// Moves the cursor to `to`. Moved into a `//`'s words, or right after it,
@@ -2494,7 +3647,9 @@ impl Input {
     fn move_to(&mut self, to: usize) {
         let from = parse::mark_holding(&self.text, self.cursor);
         self.cursor = to;
-        if let Some(at) = parse::mark_holding(&self.text, to)
+        // Not in the filter line: `by` and `late` aren't days to pick.
+        if self.kind != InputKind::Filter
+            && let Some(at) = parse::mark_holding(&self.text, to)
             && from != Some(at)
         {
             self.cal = Some(Cal { at });
@@ -2707,6 +3862,10 @@ mod tests {
             due: None,
             parent: None,
             stamp: 0,
+            done: None,
+            added: None,
+            every: None,
+            next: None,
         }
     }
 
@@ -2734,6 +3893,94 @@ mod tests {
             due: Some(due.parse().unwrap()),
             ..task
         }
+    }
+
+    /// `task`, made at `at` (`2026-11-02T10:00:00+09:00`).
+    fn added(task: Task, at: &str) -> Task {
+        Task {
+            added: Some(at.parse().unwrap()),
+            ..task
+        }
+    }
+
+    /// `task`, done at `at`.
+    fn done_at(task: Task, at: &str) -> Task {
+        Task {
+            status: Status::Done,
+            done: Some(at.parse().unwrap()),
+            ..task
+        }
+    }
+
+    /// November 2026 on the calendar, the tests' Wednesday the 11th today: …
+    ///
+    /// - 1 pay rent !high, due Fri 13, added Mon 2; 6 its sub item, due today
+    /// - 2 call mum, due today, done today; 3 fix bike, Doing, due today,
+    ///   added today; 4 buy milk, due Mon 9 (late)
+    /// - 5 water plants, done before 0.5.0; 7 an old note, from before 0.3
+    /// - 8 file taxes, done on the 3rd; 9 book the flights, due the 30th
+    fn cal_sample() -> Board {
+        let mut board = Board::new(
+            vec![
+                added(
+                    due(
+                        task(1, "pay rent", Status::Todo, Some(Priority::High), &["home"]),
+                        "2026-11-13",
+                    ),
+                    "2026-11-02T10:00:00+09:00",
+                ),
+                added(
+                    done_at(
+                        due(task(2, "call mum", Status::Todo, None, &[]), "2026-11-11"),
+                        "2026-11-11T09:30:00+09:00[Asia/Seoul]",
+                    ),
+                    "2026-11-01T10:00:00+09:00",
+                ),
+                added(
+                    due(
+                        task(3, "fix bike", Status::Doing, Some(Priority::Low), &[]),
+                        "2026-11-11T18:00",
+                    ),
+                    "2026-11-11T08:00:00+09:00",
+                ),
+                added(
+                    due(task(4, "buy milk", Status::Todo, None, &[]), "2026-11-09"),
+                    "2026-11-01T10:00:00+09:00",
+                ),
+                Task {
+                    stamp: 1_763_500_000_000,
+                    ..task(5, "water plants", Status::Done, None, &[])
+                },
+                added(
+                    sub(
+                        due(
+                            task(6, "set up the transfer", Status::Todo, None, &[]),
+                            "2026-11-11",
+                        ),
+                        1,
+                    ),
+                    "2026-11-10T21:00:00+09:00",
+                ),
+                task(7, "an old note", Status::Todo, None, &[]),
+                added(
+                    done_at(
+                        task(8, "file taxes", Status::Todo, None, &[]),
+                        "2026-11-03T20:00:00+09:00",
+                    ),
+                    "2026-10-20T10:00:00+09:00",
+                ),
+                added(
+                    due(
+                        task(9, "book the flights", Status::Todo, None, &[]),
+                        "2026-11-30",
+                    ),
+                    "2026-11-04T10:00:00+09:00",
+                ),
+            ],
+            today(),
+        );
+        board.tz = TimeZone::fixed(jiff::tz::offset(9));
+        board
     }
 
     fn sample() -> Board {
@@ -3324,6 +4571,35 @@ mod tests {
         assert!(enter(&mut board));
         assert_eq!(by_id(&board, 2).title, "pay the rent");
         assert_eq!(by_id(&board, 2).priority, Some(Priority::Med));
+    }
+
+    #[test]
+    fn e_on_one_card_or_sub_item_takes_tags_on_and_off() {
+        let mut board = sample();
+        press(&mut board, "e +work -home");
+        assert_eq!(typed(&board), Some("pay rent +work -home"));
+        assert!(enter(&mut board));
+        let rent = by_id(&board, 2);
+        assert_eq!(rent.title, "pay rent");
+        assert_eq!(rent.tags, ["money", "work"]);
+        // Tags alone, the title cleared: the title stays.
+        press(&mut board, "e");
+        ctrl(&mut board, 'u');
+        press(&mut board, "-money -work +car");
+        assert!(enter(&mut board));
+        let rent = by_id(&board, 2);
+        assert_eq!(rent.title, "pay rent");
+        assert_eq!(rent.tags, ["car"]);
+        // A sub item, as a card.
+        let mut board = sub_sample();
+        press(&mut board, "j");
+        let id = picked_id(&board).unwrap();
+        press(&mut board, "e +bank");
+        assert!(enter(&mut board));
+        assert_eq!(by_id(&board, id).tags, ["bank"]);
+        press(&mut board, "e -bank");
+        assert!(enter(&mut board));
+        assert!(by_id(&board, id).tags.is_empty());
     }
 
     #[test]
@@ -4174,52 +5450,77 @@ mod tests {
         // A card in Todo: no t.
         let mut board = sample();
         assert_eq!(
-            footer(&mut board, 120),
-            "  j k pick  space mark  h l move  s doing  d done  tab column  a add  A sub  e edit  y copy  x remove  q quit ",
+            footer(&mut board, 140),
+            "  j k pick  space mark  h l move  s doing  d done  tab column  a add  A sub  e edit  y copy  x remove  q quit  c calendar  / filter ",
             "all of it, where there's room"
         );
         assert_eq!(
-            footer(&mut board, 100),
-            "  j k pick  space mark  h l move  s doing  d done  a add  A sub  e edit  y copy  x remove  q quit ",
+            footer(&mut board, 120),
+            "  j k pick  space mark  h l move  s doing  d done  a add  A sub  e edit  y copy  x remove  q quit  c calendar  / filter ",
             "tab first"
         );
-        // tab, y, q and j k give way; then j k, needing 10 of the 8 cells
-        // left, is skipped, and q comes back; y, last, doesn't fit.
+        assert_eq!(
+            footer(&mut board, 100),
+            "  space mark  h l move  s doing  d done  a add  A sub  e edit  x remove  c calendar  / filter ",
+            "then y, q and j k"
+        );
         let (lines, _) = board.draw(90, 12);
         assert_eq!(
             text(&lines[11]),
-            "  j k pick  space mark  h l move  s doing  d done  a add  A sub  e edit  x remove  q quit ",
-            "y right after tab"
+            "  h l move  s doing  d done  a add  A sub  e edit  x remove  q quit  c calendar  / filter ",
+            "then space; q back in the room left"
         );
+        // At 80, the design session's line: space and the other column gone,
+        // the one key that removes kept.
         assert_eq!(
             footer(&mut board, 80),
-            "  space mark  h l move  s doing  d done  a add  A sub  e edit  x remove  q quit "
+            "  h l move  d done  a add  A sub  e edit  x remove  c calendar  / filter "
         );
         // In Doing: no s.
         go_to(&mut board, 1);
         assert_eq!(
             footer(&mut board, 80),
-            "  space mark  h l move  t todo  d done  a add  A sub  e edit  x remove  q quit "
+            "  h l move  d done  a add  A sub  e edit  x remove  c calendar  / filter "
         );
         // In Done: no d.
         go_to(&mut board, 2);
         assert_eq!(
             footer(&mut board, 120),
-            "  j k pick  space mark  h l move  t todo  s doing  tab column  a add  A sub  e edit  y copy  x remove  q quit "
+            "  j k pick  space mark  h l move  t todo  s doing  a add  A sub  e edit  y copy  x remove  q quit  c calendar  / filter "
         );
         assert_eq!(
             footer(&mut board, 80),
-            "  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove  q quit "
+            "  h l move  s doing  a add  A sub  e edit  x remove  c calendar  / filter "
         );
 
-        // A sub item picked: none of h l, t and s, and z for its card; the
-        // room brings j k back.
+        // A sub item picked: none of h l, t and s, and z for its card.
         let mut board = sub_sample();
         press(&mut board, "j");
         assert_eq!(
             footer(&mut board, 80),
-            "  j k pick  space mark  d done/open  a add  A sub  e edit  z fold  x remove "
+            "  d done/open  a add  A sub  e edit  z fold  x remove  c calendar  / filter "
         );
+
+        // A filter kept: its line, then the keys; `/ filter` not shown (the
+        // line says it), `esc clear` never gone. The design session's line
+        // at 80, and at 46 and 100.
+        let mut board = sub_sample();
+        press(&mut board, "/");
+        type_in(&mut board, "+home");
+        hit(&mut board, KeyCode::Enter);
+        for (w, want) in [
+            (46, "  / +home · 1 of 5  h l move  esc clear "),
+            (
+                80,
+                "  / +home · 1 of 5  h l move  d done  a add  e edit  c calendar  esc clear ",
+            ),
+            (
+                100,
+                "  / +home · 1 of 5  h l move  d done  a add  A sub  e edit  z fold  x remove  c calendar  esc clear ",
+            ),
+        ] {
+            assert_eq!(footer(&mut board, w), want, "{w}, +home kept");
+        }
 
         let mut board = marked_sample();
         assert_eq!(
@@ -4235,26 +5536,29 @@ mod tests {
 
     #[test]
     fn a_narrow_footer_gives_way_by_need_and_d_goes_last() {
-        // tab, q, j k, then t, x and s, then the least needed; d last. The
-        // room left goes back to those gone, the last to go first, one that
-        // doesn't fit skipped.
+        // tab, y, q, j k, space, the other column, z, A, x, /, c; never h l,
+        // d, a, e. The room left goes back to those gone, the last to go
+        // first, one that doesn't fit skipped.
         let mut board = sample();
         go_to(&mut board, 2);
         for (w, want) in [
             (
                 85,
-                "  j k pick  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove ",
+                "  h l move  t todo  s doing  a add  A sub  e edit  x remove  c calendar  / filter ",
             ),
             (
                 76,
-                "  space mark  h l move  t todo  s doing  a add  A sub  e edit  x remove ",
+                "  h l move  s doing  a add  A sub  e edit  x remove  c calendar  / filter ",
             ),
             (
                 66,
-                "  space mark  h l move  s doing  a add  A sub  e edit  x remove ",
+                "  h l move  a add  A sub  e edit  x remove  c calendar  / filter ",
             ),
-            (56, "  space mark  h l move  s doing  a add  A sub  e edit "),
-            (50, "  space mark  h l move  a add  A sub  e edit "),
+            (
+                56,
+                "  h l move  a add  A sub  e edit  c calendar  / filter ",
+            ),
+            (50, "  h l move  a add  e edit  c calendar  / filter "),
         ] {
             assert_eq!(footer(&mut board, w), want, "{w} wide, in Done");
         }
@@ -4263,17 +5567,14 @@ mod tests {
         for (w, want) in [
             (
                 76,
-                "  j k pick  space mark  d done/open  a add  A sub  e edit  z fold  x remove ",
+                "  d done/open  a add  A sub  e edit  z fold  x remove  c calendar  / filter ",
             ),
             (
                 66,
-                "  space mark  d done/open  a add  A sub  e edit  z fold  x remove ",
+                "  d done/open  a add  e edit  x remove  c calendar  / filter ",
             ),
-            (
-                56,
-                "  space mark  d done/open  a add  A sub  e edit  z fold ",
-            ),
-            (46, "  space mark  d done/open  a add  e edit "),
+            (56, "  d done/open  a add  e edit  c calendar  / filter "),
+            (46, "  d done/open  a add  e edit  c calendar "),
         ] {
             assert_eq!(footer(&mut board, w), want, "{w} wide, a sub item");
         }
@@ -4693,7 +5994,11 @@ mod tests {
                 count: None,
                 count_style: quiet,
                 tags: tags.map(String::from),
-                due: Some(("in 7 weeks".into(), false)),
+                due: Some(DueWords {
+                    words: "in 7 weeks".into(),
+                    late: false,
+                    step: Step::None,
+                }),
             };
             grow(head, 19, 23, whole, plain, quiet)
                 .iter()
@@ -5096,7 +6401,7 @@ mod tests {
         );
         assert_eq!(picked_id(&board), Some(1), "the pick on its row");
         assert!(
-            footer(&mut board, 80).contains(" x remove "),
+            footer(&mut board, 80).contains(" e edit "),
             "the keys again"
         );
 
@@ -5215,6 +6520,10 @@ mod tests {
         let mut fresh: Vec<Task> = board.tasks.iter().filter(|t| t.id != 3).cloned().collect();
         fresh.push(Task {
             stamp: 1_763_500_000_000,
+            done: None,
+            added: None,
+            every: None,
+            next: None,
             ..task(3, "walk the dog", Status::Doing, None, &[])
         });
         fresh
@@ -5991,8 +7300,45 @@ mod tests {
             ctrl(&mut board, 'a');
             let footer = text(&board.draw(w, 12).0[11]);
             assert!(footer.starts_with("  Edit 1  read the lease"), "{footer:?}");
-            assert!(!footer.contains("//"));
+            // Where the whole line can't fit, its start, not its date (at 80
+            // it fits whole now: the hint gives way to it).
+            let whole = "  Edit 1  ".width() + title.width() + date.width() + 1;
+            assert_eq!(footer.contains("//"), whole <= w, "{w}: {footer:?}");
         }
+    }
+
+    #[test]
+    fn the_typing_lines_hint_gives_way_to_what_is_typed() {
+        // At 46, e on a long title: `esc to cancel` goes first, then the rest,
+        // and the line's end is in sight while typing.
+        let mut board = one("pay the rent for november", "2026-12-11 18:00");
+        press(&mut board, "e");
+        let footer = text(&board.draw(46, 12).0[11]);
+        assert!(!footer.contains("enter to change"), "{footer:?}");
+        assert!(
+            footer.trim_end().ends_with("//2026-12-11 6pm"),
+            "{footer:?}"
+        );
+        // Room for part of it: `enter to change` stays, `esc to cancel` goes.
+        let mut board = one("rent", "2026-12-11");
+        press(&mut board, "e");
+        let footer = text(&board.draw(60, 12).0[11]);
+        assert!(footer.ends_with("enter to change"), "{footer:?}");
+        assert!(footer.contains("rent //2026-12-11"), "{footer:?}");
+        // Room for all of it: all of it, as before.
+        let footer = text(&board.draw(80, 12).0[11]);
+        assert!(
+            footer.ends_with("enter to change · esc to cancel"),
+            "{footer:?}"
+        );
+        // Nothing typed yet: the hint and the example, as before.
+        let mut board = one("rent", "2026-12-11");
+        press(&mut board, "a");
+        let footer = text(&board.draw(80, 12).0[11]);
+        assert!(
+            footer.ends_with("enter to add · esc to cancel"),
+            "{footer:?}"
+        );
     }
 
     #[test]
@@ -6564,7 +7910,11 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         names.sort();
-        assert_eq!(names, ["board.json", "tasks.jsonl"], "no temp file left");
+        assert_eq!(
+            names,
+            ["board.json", "tasks.jsonl", "tasks.jsonl.lock"],
+            "no temp file left; the folds kept under the tasks file's lock"
+        );
 
         // The next run: folded.
         let mut next = Board::new(store::load(&path).unwrap(), today());
@@ -6591,6 +7941,1098 @@ mod tests {
             assert!(load_folds(&folds_path(&path)).is_empty(), "{text:?}");
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // The calendar.
+
+    fn day_picked(board: &Board) -> Date {
+        board.cal.as_ref().expect("the calendar").day
+    }
+
+    fn focus(board: &Board) -> Focus {
+        board.cal.as_ref().expect("the calendar").focus
+    }
+
+    /// The calendar's list: each row's group, id and whether it's faint.
+    fn listed(board: &Board) -> Vec<(Group, u32, bool)> {
+        board
+            .entries()
+            .iter()
+            .map(|e| (e.group, e.at.id, e.faint))
+            .collect()
+    }
+
+    fn hit(board: &mut Board, code: KeyCode) -> Outcome {
+        board.key(KeyEvent::from(code))
+    }
+
+    /// Enter on the input with `text` typed in it, the change made.
+    fn enter_with(board: &mut Board, text: &str) {
+        let input = board.input.as_mut().expect("the input");
+        input.text = text.into();
+        input.cursor = text.len();
+        if let Outcome::Change(op) = hit(board, KeyCode::Enter) {
+            board.apply(op);
+        }
+    }
+
+    #[test]
+    fn c_opens_the_calendar_on_today_and_c_or_esc_go_back_and_from_halil_cal_esc_quits() {
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        assert_eq!(day_picked(&board), today());
+        assert_eq!(focus(&board), Focus::Grid);
+        assert_eq!(picked_id(&board), None, "on the grid, no task is picked");
+        press(&mut board, "c");
+        assert!(board.cal.is_none(), "c: back");
+        press(&mut board, "ㅊ");
+        assert!(board.cal.is_some(), "ㅊ is c");
+        assert_eq!(hit(&mut board, KeyCode::Esc), Outcome::Nothing);
+        assert!(board.cal.is_none(), "esc: back to the board");
+
+        // `halil cal`: esc quits, after clearing the marks.
+        let mut board = cal_sample();
+        board.open_cal(false);
+        press(&mut board, "j ");
+        assert_eq!(marks(&board), BTreeSet::from([6]));
+        assert_eq!(hit(&mut board, KeyCode::Esc), Outcome::Nothing);
+        assert!(marks(&board).is_empty());
+        assert_eq!(hit(&mut board, KeyCode::Esc), Outcome::Quit);
+        let mut board = cal_sample();
+        board.open_cal(false);
+        assert_eq!(press(&mut board, "q"), [Outcome::Quit]);
+
+        // Back on the board, a mark on a sub item it folds away goes.
+        let mut board = cal_sample();
+        board.folded.insert(r(1));
+        press(&mut board, "cj ");
+        assert_eq!(marks(&board), BTreeSet::from([6]));
+        press(&mut board, "c");
+        assert!(marks(&board).is_empty());
+    }
+
+    #[test]
+    fn the_days_move_as_the_slash_calendars_and_capital_t_goes_back_to_today() {
+        let d = jiff::civil::date;
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        let mut to = |code: KeyCode| {
+            hit(&mut board, code);
+            day_picked(&board)
+        };
+        assert_eq!(to(KeyCode::Right), d(2026, 11, 12));
+        assert_eq!(to(KeyCode::Left), d(2026, 11, 11));
+        assert_eq!(to(KeyCode::Down), d(2026, 11, 18));
+        assert_eq!(to(KeyCode::Up), d(2026, 11, 11));
+        assert_eq!(to(KeyCode::PageDown), d(2026, 12, 11));
+        assert_eq!(to(KeyCode::PageUp), d(2026, 11, 11));
+        assert_eq!(to(KeyCode::End), d(2026, 11, 30));
+        assert_eq!(to(KeyCode::Home), d(2026, 11, 1));
+        assert_eq!(to(KeyCode::Char('G')), d(2026, 11, 30));
+        assert_eq!(to(KeyCode::Char('g')), d(2026, 11, 1));
+        assert_eq!(to(KeyCode::Char('T')), today());
+        board.cal.as_mut().unwrap().day = d(2027, 1, 31);
+        assert_eq!(hit(&mut board, KeyCode::PageDown), Outcome::Nothing);
+        assert_eq!(
+            day_picked(&board),
+            d(2027, 2, 28),
+            "a month on, the month's last"
+        );
+
+        // In the list, ↑ ↓ pick; ← → still move the day, back to the grid.
+        let mut board = cal_sample();
+        press(&mut board, "cj");
+        assert_eq!((focus(&board), picked_id(&board)), (Focus::Day, Some(6)));
+        hit(&mut board, KeyCode::Down);
+        assert_eq!(day_picked(&board), today());
+        assert_eq!(picked_id(&board), Some(3));
+        hit(&mut board, KeyCode::Right);
+        assert_eq!(day_picked(&board), d(2026, 11, 12));
+        assert_eq!(focus(&board), Focus::Grid);
+        // k on the first row goes back to the grid.
+        press(&mut board, "T");
+        press(&mut board, "jk");
+        assert_eq!(focus(&board), Focus::Grid);
+    }
+
+    #[test]
+    fn a_days_list_is_due_done_and_added_and_tab_goes_round_to_what_has_no_date() {
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        assert_eq!(
+            listed(&board),
+            [
+                (Group::Due, 6, false),
+                (Group::Due, 3, false),
+                (Group::Done, 2, false),
+                (Group::Added, 3, false),
+            ],
+            "fix bike in two groups, listed in each"
+        );
+        hit(&mut board, KeyCode::Tab);
+        assert_eq!((focus(&board), picked_id(&board)), (Focus::Day, Some(6)));
+        hit(&mut board, KeyCode::Tab);
+        assert_eq!(focus(&board), Focus::Unknown);
+        assert_eq!(
+            listed(&board),
+            [(Group::Done, 5, false), (Group::Added, 7, false)],
+            "done before 0.5.0; added before 0.3.0"
+        );
+        assert_eq!(picked_id(&board), Some(5));
+        press(&mut board, "j");
+        assert_eq!(picked_id(&board), Some(7));
+        hit(&mut board, KeyCode::Tab);
+        assert_eq!(focus(&board), Focus::Grid);
+        hit(&mut board, KeyCode::BackTab);
+        assert_eq!(focus(&board), Focus::Unknown);
+        // The row says how many, and is drawn on the picked row's ground
+        // while it's picked.
+        let (lines, _) = board.draw(80, 26);
+        let row = lines
+            .iter()
+            .find(|l| text(l).contains("Date not known"))
+            .expect("the row");
+        assert_eq!(text(row).trim(), "Date not known: done 1 · added 1");
+        assert!(row.iter().any(|s| s.style.bg == Some(HIGHLIGHT)));
+
+        // A day with nothing on it: tab passes its list by.
+        press(&mut board, "T");
+        hit(&mut board, KeyCode::Right);
+        assert!(listed(&board).is_empty());
+        let (lines, _) = board.draw(80, 26);
+        assert!(
+            lines
+                .iter()
+                .any(|l| text(l).trim() == "Nothing due, done or added on Thu 12 Nov")
+        );
+        hit(&mut board, KeyCode::Tab);
+        assert_eq!(focus(&board), Focus::Unknown);
+
+        // Nothing with no date: no row, and tab passes it by.
+        let mut board = cal_sample();
+        board.tasks.retain(|t| ![5, 7].contains(&t.id));
+        press(&mut board, "c");
+        hit(&mut board, KeyCode::Tab);
+        hit(&mut board, KeyCode::Tab);
+        assert_eq!(focus(&board), Focus::Grid);
+        let (lines, _) = board.draw(80, 26);
+        assert!(!lines.iter().any(|l| text(l).contains("Date not known")));
+    }
+
+    #[test]
+    fn the_boards_keys_act_on_the_task_picked_in_the_list() {
+        let mut board = cal_sample();
+        press(&mut board, "cjj");
+        assert_eq!(picked_id(&board), Some(3), "fix bike, in Doing");
+        // h and l by its own column, not the board's pick's (in Todo).
+        assert_eq!(board.col, 0);
+        run_keys(&mut board, "h");
+        let status = |board: &Board| board.tasks[board.index(3).unwrap()].status;
+        assert_eq!(status(&board), Status::Todo);
+        run_keys(&mut board, "l");
+        assert_eq!(status(&board), Status::Doing);
+        run_keys(&mut board, "d");
+        let bike = |board: &Board| board.tasks[board.index(3).unwrap()].clone();
+        assert_eq!(bike(&board).status, Status::Done);
+        assert_eq!(
+            bike(&board).done.map(|d| d.date()),
+            Some(today()),
+            "done now"
+        );
+        assert_eq!(picked_id(&board), Some(3), "the pick stays on it");
+        // d on a done card keeps it, and its done time; t opens it again,
+        // its done time gone.
+        let done = bike(&board).done;
+        run_keys(&mut board, "d");
+        assert_eq!(
+            (bike(&board).status, bike(&board).done),
+            (Status::Done, done)
+        );
+        assert_eq!(board.note.as_deref(), Some("3 is done already."));
+        run_keys(&mut board, "t");
+        assert_eq!(bike(&board).status, Status::Todo);
+        assert_eq!(bike(&board).done, None);
+        // h l s t by its own column.
+        run_keys(&mut board, "l");
+        assert_eq!(bike(&board).status, Status::Doing);
+        run_keys(&mut board, "t");
+        assert_eq!(bike(&board).status, Status::Todo);
+        run_keys(&mut board, "s");
+        assert_eq!(bike(&board).status, Status::Doing);
+        run_keys(&mut board, "l");
+        assert_eq!(bike(&board).status, Status::Done);
+        assert!(bike(&board).done.is_some());
+        run_keys(&mut board, "h");
+        assert_eq!(bike(&board).status, Status::Doing);
+        assert_eq!(bike(&board).done, None);
+        // y, e and x as on the board.
+        assert_eq!(
+            press(&mut board, "y"),
+            [Outcome::Copy {
+                text: "fix bike".into(),
+                what: "\"fix bike\"".into()
+            }]
+        );
+        press(&mut board, "e");
+        assert_eq!(typed(&board), Some("fix bike //2026-11-11 6pm"));
+        hit(&mut board, KeyCode::Esc);
+        run_keys(&mut board, "xy");
+        assert_eq!(board.index(3), None, "removed");
+        // On a sub item, h l s and t refuse, as on the board.
+        let mut board = cal_sample();
+        press(&mut board, "cj");
+        assert_eq!(picked_id(&board), Some(6));
+        assert_eq!(press(&mut board, "s"), [Outcome::Nothing]);
+        assert_eq!(
+            board.message.as_deref(),
+            Some("a sub item moves with its task")
+        );
+        press(&mut board, "z");
+        assert!(
+            board
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("z folds on the board")
+        );
+        // Marked in the list, all at once, a sub item the board folds away
+        // too: its mark stays through a change, and y gives it after the
+        // board's rows.
+        let mut board = cal_sample();
+        board.folded.insert(r(1));
+        press(&mut board, "cj  ");
+        assert_eq!(marks(&board), BTreeSet::from([3, 6]));
+        assert_eq!(
+            press(&mut board, "y"),
+            [Outcome::Copy {
+                text: "fix bike\nset up the transfer".into(),
+                what: "2 titles".into()
+            }]
+        );
+        run_keys(&mut board, "l");
+        assert_eq!(
+            marks(&board),
+            BTreeSet::from([3, 6]),
+            "kept through a change"
+        );
+        assert_eq!(
+            board.message.as_deref(),
+            Some("1 sub item stayed: a sub item moves with its task")
+        );
+        run_keys(&mut board, "d");
+        assert!([3, 6].iter().all(|&id| {
+            let t = &board.tasks[board.index(id).unwrap()];
+            t.status == Status::Done && t.done.is_some()
+        }));
+    }
+
+    #[test]
+    fn a_task_that_leaves_the_day_stays_faint_until_the_pick_moves_and_the_note_says_where() {
+        let mut board = cal_sample();
+        press(&mut board, "cj");
+        press(&mut board, "e");
+        enter_with(&mut board, "set up the transfer //2026-11-13");
+        assert_eq!(board.note.as_deref(), Some("6 is due Fri 13 Nov now."));
+        assert_eq!(listed(&board)[0], (Group::Due, 6, true));
+        assert_eq!(picked_id(&board), Some(6), "the pick stays under the key");
+        let (lines, _) = board.draw(80, 26);
+        let row = lines
+            .iter()
+            .find(|l| text(l).contains("set up the transfer"))
+            .unwrap();
+        assert!(
+            row.iter()
+                .filter(|s| s.text.contains("set up"))
+                .all(|s| s.style.fg == Some(QUIETER)),
+            "faint"
+        );
+        // The pick moves: it's gone, and the pick is on the next task.
+        press(&mut board, "j");
+        assert!(!listed(&board).iter().any(|e| e.1 == 6));
+        assert_eq!(picked_id(&board), Some(3));
+
+        // Opened again from a day it was done on, with no date.
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        board.cal.as_mut().unwrap().day = jiff::civil::date(2026, 11, 3);
+        press(&mut board, "j");
+        assert_eq!(picked_id(&board), Some(8));
+        run_keys(&mut board, "t");
+        assert_eq!(board.note.as_deref(), Some("8 is open, with no date now."));
+        assert_eq!(listed(&board), [(Group::Done, 8, true)]);
+
+        // Done today, from a day it was due on: done on today, said so.
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        board.cal.as_mut().unwrap().day = jiff::civil::date(2026, 11, 9);
+        press(&mut board, "j");
+        run_keys(&mut board, "d");
+        assert_eq!(board.note.as_deref(), Some("4 is done on Wed 11 Nov now."));
+    }
+
+    #[test]
+    fn a_on_a_day_fills_in_its_date_and_the_new_task_is_picked_there() {
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        hit(&mut board, KeyCode::Right);
+        hit(&mut board, KeyCode::Right);
+        press(&mut board, "a");
+        assert_eq!(typed(&board), Some(" //2026-11-13"));
+        assert_eq!(board.input.as_ref().unwrap().cursor, 0, "before the date");
+        run_keys(&mut board, "water the fern");
+        assert_eq!(typed(&board), Some("water the fern //2026-11-13"));
+        if let Outcome::Change(op) = hit(&mut board, KeyCode::Enter) {
+            board.apply(op);
+        }
+        let new = board.tasks.last().unwrap().clone();
+        assert_eq!(new.title, "water the fern");
+        assert_eq!(
+            new.due.map(|d| d.date),
+            Some(jiff::civil::date(2026, 11, 13))
+        );
+        assert_eq!(new.added.map(|a| a.date()), Some(today()), "added now");
+        assert_eq!(
+            (focus(&board), picked_id(&board)),
+            (Focus::Day, Some(new.id))
+        );
+        // Typed to another day: said where it went.
+        press(&mut board, "a");
+        enter_with(&mut board, "buy stamps //2026-11-20");
+        let id = board.tasks.last().unwrap().id;
+        assert_eq!(
+            board.note.as_deref(),
+            Some(format!("Added {id}, due Fri 20 Nov.").as_str())
+        );
+        // Where nothing has a date, a starts empty.
+        hit(&mut board, KeyCode::Tab);
+        assert_eq!(focus(&board), Focus::Unknown);
+        press(&mut board, "a");
+        assert_eq!(typed(&board), Some(""));
+    }
+
+    #[test]
+    fn at_46_by_10_the_week_shows_whole() {
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        let (lines, _) = board.draw(46, 10);
+        let screen: Vec<String> = lines
+            .iter()
+            .map(|l| text(l).trim_end().to_string())
+            .collect();
+        assert_eq!(
+            screen,
+            [
+                "  November 2026            due n · ● done n",
+                "  Su  8 Mo  9 Tu 10 We 11 Th 12 Fr 13 Sa 14",
+                "            1           2           1",
+                "                       ●1",
+                "  Date not known: done 1 · added 1",
+                "  Due      set up the transfer        today",
+                "         • fix bike                   today",
+                "  Done     call mum",
+                "",
+                "  ←→ day  ↑↓ week  tab list  c board  T today",
+            ]
+        );
+        assert!(lines.iter().all(|l| text(l).width() <= 46));
+        // Under 10 rows, or 46 columns: it asks for room.
+        for (w, h) in [(46, 9), (45, 10)] {
+            let (lines, _) = board.draw(w, h);
+            assert_eq!(
+                text(&lines[0]),
+                truncate("  Make the window larger for the calendar", w)
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_days_due_count_is_red_and_todays_day_blue() {
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        hit(&mut board, KeyCode::Right);
+        let (lines, _) = board.draw(80, 26);
+        let span = |line: &Line, at: usize, s: &str| {
+            let mut x = 0;
+            for span in line {
+                if x <= at && at < x + span.text.width() && span.text.contains(s) {
+                    return Some(span.style);
+                }
+                x += span.text.width();
+            }
+            None
+        };
+        // The week of the 8th: its day line, then due.
+        let week = lines
+            .iter()
+            .position(|l| text(l).trim_start().starts_with("8 "))
+            .unwrap();
+        let due = &lines[week + 1];
+        let monday = cal::cell_x(1, 10) + 9;
+        let friday = cal::cell_x(5, 10) + 9;
+        assert_eq!(
+            span(due, monday, "due 1").unwrap().fg,
+            Some(RED),
+            "the 9th, gone"
+        );
+        assert_eq!(
+            span(due, friday, "due 1").unwrap().fg,
+            Some(AMBER),
+            "the 13th"
+        );
+        let wednesday = cal::cell_x(3, 10) + 9;
+        assert_eq!(span(&lines[week], wednesday, "11").unwrap().fg, Some(BLUE));
+        let thursday = cal::cell_x(4, 10) + 9;
+        let picked = span(&lines[week], thursday, "12").unwrap();
+        assert_eq!(
+            (picked.fg, picked.bg),
+            (Some(ON_HIGHLIGHT), Some(HIGHLIGHT))
+        );
+    }
+
+    /// Types `s` into the input, a key at a time, as typed.
+    fn type_in(board: &mut Board, s: &str) {
+        for c in s.chars() {
+            board.key(KeyEvent::from(KeyCode::Char(c)));
+        }
+    }
+
+    /// The ids in column `c`, as shown.
+    fn shown_ids(board: &Board, c: usize) -> Vec<u32> {
+        board.column(c).iter().map(|&i| board.tasks[i].id).collect()
+    }
+
+    #[test]
+    fn slash_narrows_as_its_typed_enter_keeps_it_and_esc_drops_or_clears_it() {
+        let mut board = sub_sample();
+        press(&mut board, "/");
+        assert_eq!(
+            board.input.as_ref().map(|i| i.kind),
+            Some(InputKind::Filter)
+        );
+        type_in(&mut board, "rent");
+        assert_eq!(
+            shown_ids(&board, 0),
+            [2, 5, 6, 7],
+            "the card, drawn as it is"
+        );
+        assert!(shown_ids(&board, 1).is_empty() && shown_ids(&board, 2).is_empty());
+        // A half-typed `//`: no error while typing, and it doesn't narrow yet.
+        type_in(&mut board, " //fr");
+        assert_eq!(board.message, None);
+        assert_eq!(shown_ids(&board, 0), [2, 5, 6, 7]);
+        assert_eq!(
+            board.input.as_ref().unwrap().cal,
+            None,
+            "no calendar in the filter line"
+        );
+        // Enter on it: refused in words, the words kept.
+        assert_eq!(hit(&mut board, KeyCode::Enter), Outcome::Nothing);
+        assert_eq!(board.message.as_deref(), Some("`//fr` isn't a date"));
+        assert_eq!(typed(&board), Some("rent //fr"));
+        for _ in 0..5 {
+            hit(&mut board, KeyCode::Backspace);
+        }
+        hit(&mut board, KeyCode::Enter);
+        assert_eq!(board.input, None, "kept, the keys the board's");
+        assert_eq!(board.filter.as_ref().map(|f| f.text.as_str()), Some("rent"));
+        let f = footer(&mut board, 80);
+        assert!(f.starts_with("  / rent · 1 of 5 "), "{f}");
+        assert!(f.contains(" esc clear "), "{f}");
+        // `/` again edits it; esc while typing drops what's typed, the kept
+        // one back.
+        press(&mut board, "/");
+        assert_eq!(typed(&board), Some("rent"));
+        type_in(&mut board, " +zzz");
+        assert!(shown_ids(&board, 0).is_empty());
+        hit(&mut board, KeyCode::Esc);
+        assert_eq!(board.filter.as_ref().map(|f| f.text.as_str()), Some("rent"));
+        // Esc on the board clears it; the next quits.
+        assert_eq!(hit(&mut board, KeyCode::Esc), Outcome::Nothing);
+        assert_eq!(board.filter, None);
+        assert_eq!(hit(&mut board, KeyCode::Esc), Outcome::Quit);
+        // Hangul in the filter line is text, not keys.
+        let mut board = sub_sample();
+        press(&mut board, "/");
+        board.key(KeyEvent::from(KeyCode::Char('월')));
+        assert_eq!(typed(&board), Some("월"));
+    }
+
+    #[test]
+    fn the_pick_stays_on_its_card_else_goes_to_the_first_shown() {
+        let filtered = |board: &mut Board, text: &str| {
+            press(board, "/");
+            type_in(board, text);
+            hit(board, KeyCode::Enter);
+        };
+        // It matches: it stays.
+        let mut board = sub_sample();
+        assert_eq!(picked_id(&board), Some(2));
+        filtered(&mut board, "+home");
+        assert_eq!(picked_id(&board), Some(2));
+        // It doesn't: the first shown in its column.
+        let mut board = sub_sample();
+        press(&mut board, "jjjj");
+        assert_eq!(picked_id(&board), Some(1));
+        filtered(&mut board, "rent");
+        assert_eq!((board.col, picked_id(&board)), (0, Some(2)));
+        // Its column shows nothing: the first shown.
+        let mut board = sub_sample();
+        go_to(&mut board, 1);
+        assert_eq!(picked_id(&board), Some(3));
+        filtered(&mut board, "milk");
+        assert_eq!((board.col, picked_id(&board)), (0, Some(1)));
+        // Clearing keeps the pick.
+        hit(&mut board, KeyCode::Esc);
+        assert_eq!(picked_id(&board), Some(1));
+    }
+
+    #[test]
+    fn what_a_change_takes_out_of_the_filter_stays_faint_until_it_changes() {
+        let mut board = sub_sample();
+        press(&mut board, "/");
+        type_in(&mut board, "+home");
+        hit(&mut board, KeyCode::Enter);
+        assert_eq!(picked_id(&board), Some(2));
+        press(&mut board, "e");
+        enter_with(&mut board, "pay rent -home");
+        assert_eq!(board.note.as_deref(), Some("No longer matches +home."));
+        assert_eq!(shown_ids(&board, 0)[0], 2, "still shown");
+        let (lines, _) = board.draw(100, 12);
+        let row = &lines[3];
+        assert!(
+            row.iter()
+                .filter(|s| s.text.contains("pay rent"))
+                .all(|s| s.style.fg == Some(QUIETER)),
+            "faint"
+        );
+        // Added under it, not matching: there too, faint.
+        press(&mut board, "a");
+        enter_with(&mut board, "water plants");
+        let id = board.tasks.last().unwrap().id;
+        assert!(shown_ids(&board, 0).contains(&id));
+        assert_eq!(board.note.as_deref(), Some("No longer matches +home."));
+        // The filter changes: they go.
+        press(&mut board, "/");
+        hit(&mut board, KeyCode::Enter);
+        press(&mut board, "/");
+        type_in(&mut board, "+home");
+        hit(&mut board, KeyCode::Enter);
+        assert!(shown_ids(&board, 0).is_empty());
+        let (lines, _) = board.draw(100, 12);
+        assert!(lines.iter().any(|l| text(l).trim() == "Nothing matches"));
+        // Counts are of what's shown.
+        assert!(text(&lines[1]).contains("Todo  0"), "{}", text(&lines[1]));
+    }
+
+    #[test]
+    fn the_kept_filter_line_at_46_never_gives_way() {
+        let mut board = sub_sample();
+        press(&mut board, "/");
+        type_in(&mut board, "+home rent");
+        hit(&mut board, KeyCode::Enter);
+        let f = footer(&mut board, 46);
+        assert!(f.starts_with("  / +home rent · 1 of 5 "), "{f}");
+        assert!(f.width() <= 46, "{f}");
+        // The hints gave way before it: at 46 one is left at most.
+        let hints = f.trim_start_matches("  / +home rent · 1 of 5 ");
+        assert!(hints.width() <= 46 - 24, "{f}");
+        // While it's typed: its hint for the dates.
+        press(&mut board, "/");
+        let f = footer(&mut board, 80);
+        assert!(f.starts_with("  /  +home rent"), "{f}");
+        assert!(f.ends_with("//fri  //by fri  //late"), "{f}");
+    }
+
+    #[test]
+    fn the_calendar_counts_only_what_the_filter_shows_and_c_keeps_it() {
+        let mut board = cal_sample();
+        press(&mut board, "/");
+        type_in(&mut board, "+home");
+        hit(&mut board, KeyCode::Enter);
+        let on_board = footer(&mut board, 80);
+        press(&mut board, "c");
+        assert!(board.filter.is_some(), "c keeps it");
+        // One count, cards, in both views: 1 of the 8 cards (9 tasks, one a
+        // sub item).
+        let on_calendar = footer(&mut board, 80);
+        assert!(on_board.starts_with("  / +home · 1 of 8 "), "{on_board}");
+        assert!(
+            on_calendar.starts_with("  / +home · 1 of 8 "),
+            "{on_calendar}"
+        );
+        let counts = cal::counts(&board.visible());
+        let on = |d| {
+            counts
+                .get(&jiff::civil::date(2026, 11, d))
+                .copied()
+                .unwrap_or_default()
+        };
+        assert_eq!(on(13), cal::Counts { due: 1, done: 0 }, "pay rent");
+        assert_eq!(
+            on(11),
+            cal::Counts::default(),
+            "nothing on today with +home"
+        );
+        assert_eq!(on(3), cal::Counts::default(), "file taxes hasn't +home");
+        board.cal.as_mut().unwrap().day = jiff::civil::date(2026, 11, 13);
+        assert_eq!(listed(&board), [(Group::Due, 1, false)]);
+        // The not-known row counts what's shown too: neither has +home.
+        let (lines, _) = board.draw(80, 26);
+        assert!(!lines.iter().any(|l| text(l).contains("Date not known")));
+        press(&mut board, "c");
+        assert!(board.filter.is_some(), "and back");
+    }
+
+    /// The sample, pay rent due Friday and repeating weekly.
+    fn weekly_sample() -> Board {
+        let mut board = sample();
+        let rent = board.index(2).unwrap();
+        board.tasks[rent].due = Some("2026-11-13".parse().unwrap());
+        board.tasks[rent].every = Some("week".parse().unwrap());
+        board
+    }
+
+    #[test]
+    fn d_on_a_repeating_card_says_its_next_and_t_on_the_done_one_where_it_went() {
+        let mut board = weekly_sample();
+        assert_eq!(picked_id(&board), Some(2));
+        run_keys(&mut board, "d");
+        assert_eq!(board.note.as_deref(), Some("Done. Next: fri nov 20."));
+        let next = board.tasks.last().unwrap().clone();
+        assert_eq!(
+            (
+                next.title.as_str(),
+                next.due.unwrap().to_string(),
+                next.status
+            ),
+            ("pay rent", "2026-11-20".into(), Status::Todo)
+        );
+        assert_eq!(next.every, Some("week".parse().unwrap()));
+        assert_eq!(
+            by_id(&board, 2).every,
+            None,
+            "the done one no longer repeats"
+        );
+        // The done one opened again: a plain task, and where its repeat is.
+        go_to(&mut board, 2);
+        while picked_id(&board) != Some(2) {
+            press(&mut board, "j");
+        }
+        run_keys(&mut board, "t");
+        assert_eq!(
+            board.note.as_deref(),
+            Some(format!("Reopened. Its repeat is on #{}.", next.id).as_str())
+        );
+        assert_eq!(
+            (by_id(&board, 2).every, by_id(&board, 2).next),
+            (None, None)
+        );
+        // x on a repeating one removes it and makes nothing.
+        let mut board = weekly_sample();
+        let n = board.tasks.len();
+        run_keys(&mut board, "xy");
+        assert_eq!(board.tasks.len(), n - 1);
+    }
+
+    #[test]
+    fn e_holds_the_repeat_and_the_date_rule_says_what_deleting_it_does() {
+        let mut board = weekly_sample();
+        press(&mut board, "e");
+        assert_eq!(typed(&board), Some("pay rent //2026-11-13 every week"));
+        // The step's words taken out: the step stays, as the date stays when
+        // its words are taken out (0.4.1's rule for the date).
+        enter_with(&mut board, "pay rent //2026-11-14");
+        assert_eq!(by_id(&board, 2).every, Some("week".parse().unwrap()));
+        assert_eq!(by_id(&board, 2).due.unwrap().to_string(), "2026-11-14");
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Still every week — -every stops it.")
+        );
+        // The same line again, nothing else to change: said all the same.
+        press(&mut board, "e");
+        enter_with(&mut board, "pay rent //2026-11-14");
+        assert_eq!(
+            board.note.as_deref(),
+            Some("Still every week — -every stops it.")
+        );
+        // The step's words left in the line: nothing to say.
+        press(&mut board, "e");
+        assert_eq!(typed(&board), Some("pay rent //2026-11-14 every week"));
+        hit(&mut board, KeyCode::Enter);
+        assert_eq!(board.note, None);
+        // -every stops it.
+        press(&mut board, "e");
+        enter_with(&mut board, "pay rent //2026-11-14 every week -every");
+        assert_eq!(
+            by_id(&board, 2).every,
+            Some("week".parse().unwrap()),
+            "a new step wins"
+        );
+        press(&mut board, "e");
+        enter_with(&mut board, "pay rent -every");
+        assert_eq!(by_id(&board, 2).every, None);
+        // A on a card: a sub item repeats with its card.
+        let mut board = weekly_sample();
+        press(&mut board, "A");
+        let input = board.input.as_mut().unwrap();
+        input.text = "x //every week".into();
+        input.cursor = input.text.len();
+        assert_eq!(hit(&mut board, KeyCode::Enter), Outcome::Nothing);
+        assert_eq!(board.message.as_deref(), Some(crate::REPEATS_WITH_ITS_CARD));
+    }
+
+    #[test]
+    fn a_cut_repeating_card_shows_a_star_and_its_overlay_the_step() {
+        let mut board = weekly_sample();
+        let rent = board.index(2).unwrap();
+        board.tasks[rent].title = "pay the rent for november and keep the receipt".into();
+        board.tasks[rent].tags.clear();
+        // Not picked, cut: `*` right after the date (at 100: at 80 a column
+        // has no room for the date at all, as ever).
+        press(&mut board, "j");
+        let (lines, _) = board.draw(100, 12);
+        let row = text(&lines[3]);
+        assert!(row.contains("in 2 days*"), "{row}");
+        assert!(!row.contains("weekly"), "{row}");
+        // Picked: its overlay spells the step, at 80 too.
+        press(&mut board, "k");
+        for w in [80, 100] {
+            let (lines, _) = board.draw(w, 12);
+            let row = text(&lines[3]);
+            assert!(row.contains("in 2 days weekly"), "{w}: {row}");
+        }
+        // Room for the title whole: the step's words after the date, faint.
+        board.tasks[rent].title = "pay rent".into();
+        press(&mut board, "j");
+        let (lines, _) = board.draw(120, 12);
+        let row = &lines[3];
+        assert!(text(row).contains("in 2 days weekly"), "{}", text(row));
+        let step = row.iter().find(|s| s.text == "weekly").unwrap();
+        assert_eq!(step.style.fg, Some(QUIETER));
+        // A whole title takes the step's words, though they leave it less
+        // than the 8 cells a cut title keeps: `*` is for a cut one.
+        board.tasks[rent].title = "water".into();
+        board.tasks[rent].due = Some("2026-11-11".parse().unwrap());
+        let (lines, _) = board.draw(80, 12);
+        let row = text(&lines[3]);
+        assert!(row.contains("water  today weekly"), "{row}");
+    }
+
+    #[test]
+    fn the_calendar_draws_only_real_tasks_and_keeps_typed_steps() {
+        let mut board = weekly_sample();
+        press(&mut board, "c");
+        let counts = cal::counts(&board.tasks);
+        let fridays =
+            [13, 20, 27].map(|d| counts.get(&jiff::civil::date(2026, 11, d)).map(|c| c.due));
+        assert_eq!(fridays, [Some(1), None, None], "no coming repeat drawn");
+        // Its day's list: the step after the date.
+        board.cal.as_mut().unwrap().day = jiff::civil::date(2026, 11, 13);
+        let (lines, _) = board.draw(100, 26);
+        assert!(
+            lines
+                .iter()
+                .any(|l| text(l).contains("pay rent") && text(l).contains("weekly"))
+        );
+        // The `//` calendar moves the date and leaves the typed step.
+        let mut board = sample();
+        press(&mut board, "a");
+        let input = board.input.as_mut().unwrap();
+        input.text = "x //fri every week".into();
+        input.cursor = input.text.len();
+        input.cal = Some(Cal { at: 2 });
+        hit(&mut board, KeyCode::Down);
+        assert_eq!(typed(&board), Some("x //2026-11-20 every week"));
+    }
+
+    #[test]
+    fn the_popup_on_a_weekday_step_shows_and_writes_the_day_its_due() {
+        let open = |board: &mut Board, text: &str| {
+            press(board, "a");
+            let input = board.input.as_mut().unwrap();
+            input.text = text.into();
+            input.cursor = input.text.len();
+            input.cal = Some(Cal { at: 2 });
+        };
+        // It shows what the line reads as: nov 28, a saturday, every friday
+        // is due friday dec 4, and that's the day picked.
+        let mut board = sample();
+        open(&mut board, "x //nov 28 every fri");
+        let (lines, _) = board.draw(80, 20);
+        let top = lines
+            .iter()
+            .position(|l| text(l).contains("December 2026"))
+            .expect("its month");
+        let picked: Vec<String> = lines[top..top + 9]
+            .iter()
+            .flat_map(|l| l.iter())
+            .filter(|s| s.style.bg == Some(HIGHLIGHT))
+            .map(|s| s.text.trim().to_string())
+            .collect();
+        assert_eq!(picked, ["4"], "friday the 4th picked");
+        // A move rewrites the weekday to the picked day's, as the date's words.
+        hit(&mut board, KeyCode::Right);
+        assert_eq!(typed(&board), Some("x //2026-12-05 every sat"));
+        let mut board = sample();
+        open(&mut board, "x //every fri");
+        hit(&mut board, KeyCode::Right);
+        assert_eq!(typed(&board), Some("x //2026-11-14 every sat"));
+        hit(&mut board, KeyCode::Down);
+        assert_eq!(typed(&board), Some("x //2026-11-21 every sat"));
+        // Other steps stay as typed.
+        let mut board = sample();
+        open(&mut board, "x //fri every 2 weeks");
+        hit(&mut board, KeyCode::Right);
+        assert_eq!(typed(&board), Some("x //2026-11-14 every 2 weeks"));
+        // Typed by hand, `//sat every fri` keeps its reading: the first friday
+        // on or after saturday.
+        let p = parse::parse(&["x //sat every fri".to_string()], board.now()).unwrap();
+        assert_eq!(p.due.unwrap().to_string(), "2026-11-20");
+    }
+
+    #[test]
+    fn the_folds_are_kept_under_the_tasks_files_lock() {
+        let dir = env::temp_dir().join(format!("halil-test-{}-folds-lock", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.jsonl");
+        let mut board = sub_sample();
+        board.folded.insert(r(2));
+        board.folds_changed = true;
+        // Another halil holds the file for 300 ms: the folds wait for it.
+        let held = store::lock(&path).unwrap();
+        let other = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let start = std::time::Instant::now();
+        board.keep_folds(&path);
+        let waited = start.elapsed();
+        other.join().unwrap();
+        assert!(waited >= Duration::from_millis(250), "{waited:?}");
+        assert_eq!(board.message, None);
+        assert_eq!(load_folds(&folds_path(&path)), BTreeSet::from([r(2)]));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_board_save_racing_an_add_keeps_both() {
+        let dir = env::temp_dir().join(format!("halil-test-{}-board-race", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tasks.jsonl");
+        let mut board = sample();
+        for t in &mut board.tasks {
+            t.stamp = 1_763_500_000_000 + u64::from(t.id);
+        }
+        store::save(&path, &board.tasks).unwrap();
+        let one = board.held(board.index(1).unwrap());
+        // `halil add` from another terminal, holding the file between its
+        // read and its write.
+        let (holding, held) = mpsc::channel();
+        let add = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                store::update(&path, |tasks| {
+                    holding.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                    let id = task::next_id(tasks);
+                    tasks.push(task(id, "added elsewhere", Status::Todo, None, &[]));
+                    Ok(((), true))
+                })
+                .unwrap();
+            })
+        };
+        held.recv().unwrap();
+        // Meanwhile the board finishes 1: it waits, then makes its change to
+        // the file as the add left it.
+        board.save_change(&path, Op::Finish { refs: vec![one] });
+        add.join().unwrap();
+        let tasks = store::load(&path).unwrap();
+        assert!(
+            tasks.iter().any(|t| t.title == "added elsewhere"),
+            "the add kept"
+        );
+        let one = tasks.iter().find(|t| t.id == 1).unwrap();
+        assert_eq!(one.status, Status::Done, "the board's change kept");
+        assert!(
+            board.tasks.iter().any(|t| t.title == "added elsewhere"),
+            "and the board shows the add"
+        );
+        assert_eq!(board.message, None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_boards_footer_shows_c_calendar_at_80_in_every_case() {
+        let mut board = sample();
+        for c in 0..COLUMNS.len() {
+            go_to(&mut board, c);
+            let f = footer(&mut board, 80);
+            assert!(f.contains("  c calendar "), "column {c}: {f}");
+        }
+        let mut board = sub_sample();
+        press(&mut board, "j");
+        let f = footer(&mut board, 80);
+        assert!(f.contains("  c calendar "), "a sub item: {f}");
+        // Narrower, x gives way before / and c, and / before c.
+        let mut board = sample();
+        go_to(&mut board, 2);
+        let f = footer(&mut board, 56);
+        assert!(
+            f.contains(" c calendar ") && f.contains(" / filter ") && !f.contains(" x remove "),
+            "{f}"
+        );
+        let f = footer(&mut board, 46);
+        assert!(
+            f.contains(" c calendar ") && !f.contains(" / filter "),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn the_calendars_footer_shows_the_way_back_at_every_width() {
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        for (state, keys) in [
+            ("the grid", ""),
+            ("a sub item", "j"),
+            ("a card in Doing", "j"),
+            ("a done card", "j"),
+        ] {
+            press(&mut board, keys);
+            for w in 46..=240 {
+                let f = footer(&mut board, w);
+                assert!(f.contains("  c board "), "{state}, {w}: {f}");
+            }
+        }
+        board.key(KeyEvent::from(KeyCode::Tab));
+        for w in 46..=240 {
+            let f = footer(&mut board, w);
+            assert!(f.contains("  c board "), "what has no date, {w}: {f}");
+        }
+        // On the grid, right after the moves and tab, ahead of T and a.
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        assert_eq!(
+            footer(&mut board, 46),
+            "  ←→ day  ↑↓ week  tab list  c board  T today "
+        );
+        assert_eq!(
+            footer(&mut board, 80),
+            "  ←→ day  ↑↓ week  pgup pgdn month  tab list  c board  / filter  T today  a add "
+        );
+    }
+
+    #[test]
+    fn d_in_the_calendar_keeps_a_done_task_done_and_the_moves_open_it() {
+        let mut board = cal_sample();
+        // 6, a sub item, done today too.
+        let six = board.index(6).unwrap();
+        board.tasks[six] = done_at(
+            board.tasks[six].clone(),
+            "2026-11-11T08:00:00+09:00[Asia/Seoul]",
+        );
+        press(&mut board, "c");
+        assert_eq!(
+            listed(&board),
+            [
+                (Group::Due, 3, false),
+                (Group::Done, 2, false),
+                (Group::Done, 6, false),
+                (Group::Added, 3, false),
+            ]
+        );
+        let at = |board: &Board, id: u32| board.tasks[board.index(id).unwrap()].clone();
+        for (id, keys) in [(2, "jj"), (6, "j")] {
+            press(&mut board, keys);
+            assert_eq!(picked_id(&board), Some(id));
+            let before = at(&board, id);
+            assert_eq!(press(&mut board, "d"), [Outcome::Nothing]);
+            assert_eq!(at(&board, id), before, "{id}: done, its time kept");
+            assert_eq!(
+                board.note.as_deref(),
+                Some(format!("{id} is done already.").as_str())
+            );
+            // No d where a done task is picked.
+            let f = footer(&mut board, 120);
+            assert!(!f.contains(" d "), "{f}");
+        }
+        // A done card's footer has the moves that open it, and they do.
+        press(&mut board, "k");
+        assert_eq!(picked_id(&board), Some(2));
+        let f = footer(&mut board, 80);
+        assert!(f.contains(" h l move ") && f.contains(" s doing "), "{f}");
+        run_keys(&mut board, "s");
+        assert_eq!(
+            (at(&board, 2).status, at(&board, 2).done),
+            (Status::Doing, None)
+        );
+        // What has no date: the moves, no d.
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        board.key(KeyEvent::from(KeyCode::Tab));
+        board.key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(picked_id(&board), Some(5));
+        let f = footer(&mut board, 46);
+        assert_eq!(f, "  h l move  c board  / filter  a add  e edit ");
+    }
+
+    #[test]
+    fn every_change_of_status_on_the_board_sets_keeps_or_clears_the_done_time() {
+        let mut board = sub_sample();
+        let at = |board: &Board, id: u32| board.tasks[board.index(id).unwrap()].clone();
+        // d on a card: it and its open sub items done now; 5, done before,
+        // keeps no time.
+        board.apply(Op::Finish { refs: refs(&[2]) });
+        for id in [2, 6, 7] {
+            let t = at(&board, id);
+            assert_eq!(
+                (t.status, t.done.map(|d| d.date())),
+                (Status::Done, Some(today()))
+            );
+        }
+        assert_eq!(at(&board, 5).done, None);
+        // Done already: its time kept.
+        let kept = at(&board, 2).done;
+        board.apply(Op::Finish { refs: refs(&[2]) });
+        assert_eq!(at(&board, 2).done, kept);
+        // Out of Done, by s, t or h: none.
+        board.apply(Op::Send {
+            refs: refs(&[2]),
+            to: Status::Todo,
+        });
+        assert_eq!(at(&board, 2).done, None);
+        assert!(at(&board, 6).done.is_some(), "its sub items stay done");
+        board.apply(Op::Shift {
+            refs: refs(&[2]),
+            by: 1,
+        });
+        board.apply(Op::Shift {
+            refs: refs(&[2]),
+            by: 1,
+        });
+        assert!(at(&board, 2).done.is_some(), "l into Done");
+        board.apply(Op::Move {
+            at: r(2),
+            to: Status::Doing,
+            follow: false,
+        });
+        assert_eq!(at(&board, 2).done, None);
+        board.apply(Op::Move {
+            at: r(6),
+            to: Status::Todo,
+            follow: false,
+        });
+        assert_eq!(at(&board, 6).done, None, "a sub item opened again");
+        // A task added on the board: made now.
+        board.apply(Op::Add {
+            task: parse::parse(&["x".to_string()], board.now()).unwrap(),
+            parent: None,
+        });
+        let new = board.tasks.last().unwrap();
+        assert_eq!(new.added.as_ref().map(|a| a.date()), Some(today()));
+        assert_eq!(new.done, None);
     }
 
     // Shots for the design session: `HALIL_SHOTS=<dir> cargo test shots --
@@ -7140,6 +9582,246 @@ mod tests {
             );
             press(&mut board, "z");
             shoot(&sheet, "z again: back, and why", &mut board, w, 18);
+        }
+
+        // The calendar: 46×10 first, the narrowest, a week; then months.
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        shoot(
+            "cal-46",
+            "c: the week of today, nothing picked",
+            &mut board,
+            46,
+            10,
+        );
+        press(&mut board, "j");
+        shoot("cal-46", "j: the day's first task", &mut board, 46, 10);
+        board.key(KeyEvent::from(KeyCode::Tab));
+        shoot("cal-46", "tab: what has no date", &mut board, 46, 10);
+        let mut board = cal_sample();
+        press(&mut board, "c");
+        shoot("cal-46", "the month", &mut board, 46, 26);
+        for (w, h) in [(80, 26), (120, 20), (120, 26)] {
+            let sheet = format!("cal-{w}");
+            let mut board = cal_sample();
+            press(&mut board, "c");
+            shoot(&sheet, "c: today, late days red", &mut board, w, h);
+            press(&mut board, "j");
+            shoot(&sheet, "j: the day's first task", &mut board, w, h);
+            run_keys(&mut board, "d");
+            shoot(
+                &sheet,
+                "d: done, still listed under Due, faint",
+                &mut board,
+                w,
+                h,
+            );
+            press(&mut board, "j");
+            shoot(
+                &sheet,
+                "j: the pick moved, the faint row gone",
+                &mut board,
+                w,
+                h,
+            );
+            board.key(KeyEvent::from(KeyCode::Tab));
+            shoot(
+                &sheet,
+                "tab: what has no date, both groups",
+                &mut board,
+                w,
+                h,
+            );
+            board.key(KeyEvent::from(KeyCode::Tab));
+            board.key(KeyEvent::from(KeyCode::Right));
+            board.key(KeyEvent::from(KeyCode::Right));
+            shoot(&sheet, "tab, → →: Friday", &mut board, w, h);
+            board.key(KeyEvent::from(KeyCode::PageDown));
+            shoot(&sheet, "pgdn: December", &mut board, w, h);
+            press(&mut board, "a");
+            shoot(&sheet, "a: the day filled in", &mut board, w, h);
+        }
+
+        // Repeating: a card whole with its step, one cut with `*` and its
+        // overlay; done, and the note; the calendar's day.
+        let repeating = || {
+            let mut board = Board::new(
+                vec![
+                    task(1, "water", Status::Todo, None, &[]),
+                    task(
+                        2,
+                        "pay the rent for november and keep the receipt",
+                        Status::Todo,
+                        Some(Priority::High),
+                        &["home"],
+                    ),
+                    task(3, "fix bike", Status::Doing, Some(Priority::Low), &[]),
+                    task(4, "call mum", Status::Done, None, &[]),
+                ],
+                today(),
+            );
+            board.tasks[0].due = Some("2026-11-11".parse().unwrap());
+            board.tasks[0].every = Some("week".parse().unwrap());
+            board.tasks[1].due = Some("2026-11-11T18:00".parse().unwrap());
+            board.tasks[1].every = Some("month on the 11th".parse().unwrap());
+            board.tz = TimeZone::fixed(jiff::tz::offset(9));
+            board
+        };
+        for w in [46, 80, 100] {
+            let sheet = format!("repeat-{w}");
+            let mut board = repeating();
+            board.key(KeyEvent::from(KeyCode::Tab));
+            shoot(
+                &sheet,
+                "a repeating card whole, one cut: today*",
+                &mut board,
+                w,
+                12,
+            );
+            board.key(KeyEvent::from(KeyCode::BackTab));
+            while picked_id(&board) != Some(2) {
+                press(&mut board, "j");
+            }
+            shoot(
+                &sheet,
+                "the cut one picked: its overlay spells the step",
+                &mut board,
+                w,
+                12,
+            );
+            run_keys(&mut board, "d");
+            shoot(&sheet, "d: done, and its next", &mut board, w, 12);
+            press(&mut board, "e");
+            shoot(
+                &sheet,
+                "e on the next: the repeat in the line",
+                &mut board,
+                w,
+                12,
+            );
+            board.key(KeyEvent::from(KeyCode::Esc));
+            press(&mut board, "c");
+            shoot(
+                &sheet,
+                "c: today's list, the steps after the dates",
+                &mut board,
+                w,
+                14,
+            );
+        }
+
+        // The filter: typing, kept, a change it takes out, nothing matching,
+        // the calendar under it.
+        for w in [46, 80] {
+            let sheet = format!("filter-{w}");
+            let mut board = sub_sample();
+            press(&mut board, "/");
+            for c in "+home".chars() {
+                board.key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            shoot(
+                &sheet,
+                "/ +home: narrowing as it's typed",
+                &mut board,
+                w,
+                12,
+            );
+            board.key(KeyEvent::from(KeyCode::Enter));
+            shoot(&sheet, "enter: kept, always in sight", &mut board, w, 12);
+            press(&mut board, "e");
+            let input = board.input.as_mut().unwrap();
+            input.text = "pay rent -home".into();
+            if let Outcome::Change(op) = board.key(KeyEvent::from(KeyCode::Enter)) {
+                board.apply(op);
+            }
+            shoot(
+                &sheet,
+                "e: -home, faint until the filter changes",
+                &mut board,
+                w,
+                12,
+            );
+            press(&mut board, "/");
+            for _ in 0..5 {
+                board.key(KeyEvent::from(KeyCode::Backspace));
+            }
+            for c in "zzz".chars() {
+                board.key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            board.key(KeyEvent::from(KeyCode::Enter));
+            shoot(&sheet, "/ zzz: nothing matches", &mut board, w, 12);
+            let mut board = cal_sample();
+            press(&mut board, "/");
+            for c in "+home".chars() {
+                board.key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            board.key(KeyEvent::from(KeyCode::Enter));
+            press(&mut board, "c");
+            shoot(
+                &sheet,
+                "c: the calendar under +home, its counts of it",
+                &mut board,
+                w,
+                26,
+            );
+        }
+
+        // The design session's five changes after 0.5.0's sheets.
+        for w in [46, 80, 100] {
+            let sheet = format!("changes-{w}");
+            let mut board = sub_sample();
+            shoot(&sheet, "the footer, no filter", &mut board, w, 12);
+            press(&mut board, "/");
+            for c in "+home".chars() {
+                board.key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            board.key(KeyEvent::from(KeyCode::Enter));
+            shoot(&sheet, "the footer, +home kept", &mut board, w, 12);
+            press(&mut board, "e");
+            let input = board.input.as_mut().unwrap();
+            input.text = "pay rent -home".into();
+            if let Outcome::Change(op) = board.key(KeyEvent::from(KeyCode::Enter)) {
+                board.apply(op);
+            }
+            shoot(&sheet, "e: -home, the faint note", &mut board, w, 12);
+            let mut board = weekly_sample();
+            press(&mut board, "e");
+            let input = board.input.as_mut().unwrap();
+            input.text = "pay rent //2026-11-14".into();
+            if let Outcome::Change(op) = board.key(KeyEvent::from(KeyCode::Enter)) {
+                board.apply(op);
+            }
+            shoot(
+                &sheet,
+                "e with every week taken out: still said",
+                &mut board,
+                w,
+                12,
+            );
+            let mut board = one("pay the rent for november", "2026-12-11 18:00");
+            press(&mut board, "e");
+            shoot(
+                &sheet,
+                "e on a long title: the hint gives way",
+                &mut board,
+                w,
+                12,
+            );
+            let mut board = sample();
+            press(&mut board, "a");
+            let input = board.input.as_mut().unwrap();
+            input.text = "x //nov 28 every fri".into();
+            input.cursor = input.text.len();
+            input.cal = Some(Cal { at: 2 });
+            shoot(
+                &sheet,
+                "the popup on //nov 28 every fri: friday the 4th",
+                &mut board,
+                w,
+                14,
+            );
+            board.key(KeyEvent::from(KeyCode::Right));
+            shoot(&sheet, "→: the 5th, every sat", &mut board, w, 14);
         }
 
         for (name, (p, a)) in sheets {
