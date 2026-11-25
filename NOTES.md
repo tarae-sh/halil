@@ -5,6 +5,10 @@
 - Undo, for every change: the board's `x` removes for good, and so does every other key's change.
 - A save that crashes leaves its `tasks.jsonl.<pid>.tmp` behind, and nothing clears it.
 
+## Done in 0.4.2
+
+- Under WSL, the board's `y` no longer uses `clip.exe`, which read the title in the console's code page and pasted Hangul as garbage (`?댑슸`): `win32yank.exe` when it's there, else `wl-copy` under WSLg, else `powershell.exe` reading UTF-8, else OSC 52.
+
 ## Done in 0.3
 
 - Ids are reused after a remove, so on the board a mark or an open input could follow an id to a new task. Mended

@@ -14,8 +14,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long a copy command may take before it's killed and said to have
-/// failed.
-pub const LIMIT: Duration = Duration::from_secs(2);
+/// failed: room for `powershell.exe`, which can take a second or two to
+/// start under WSL.
+pub const LIMIT: Duration = Duration::from_secs(5);
+
+/// `powershell.exe`'s arguments under WSL: its input read as UTF-8, set
+/// explicitly. Left to itself it reads the console's code page (CP949 on
+/// Korean Windows), as `clip.exe` does, and Hangul comes out as garbage.
+pub const POWERSHELL: &[&str] = &[
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+];
 
 /// Where `y` copies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,21 +69,34 @@ pub struct Platform {
 }
 
 /// The clipboard for `platform`, `has` saying whether a program is there:
-/// `pbcopy` on macOS, `clip.exe` under WSL, `wl-copy` under Wayland, `xclip`
+/// `pbcopy` on macOS; under WSL `win32yank.exe`, else `wl-copy` under WSLg,
+/// else `powershell.exe` (never `clip.exe`, which reads its input in the
+/// console's code page and garbles Hangul); `wl-copy` under Wayland, `xclip`
 /// under X; else the terminal's.
 pub fn choose(platform: Platform, has: impl Fn(&str) -> bool) -> Clipboard {
     let command = |program: &str, args: &[&str]| Clipboard::Command {
         program: program.into(),
         args: args.iter().map(|a| a.to_string()).collect(),
     };
-    match platform {
-        Platform { mac: true, .. } if has("pbcopy") => command("pbcopy", &[]),
-        Platform { wsl: true, .. } if has("clip.exe") => command("clip.exe", &[]),
-        Platform { wayland: true, .. } if has("wl-copy") => command("wl-copy", &[]),
-        Platform { x11: true, .. } if has("xclip") => {
-            command("xclip", &["-selection", "clipboard"])
+    let wayland = platform.wayland && has("wl-copy");
+    if platform.mac && has("pbcopy") {
+        command("pbcopy", &[])
+    } else if platform.wsl {
+        if has("win32yank.exe") {
+            command("win32yank.exe", &["-i", "--crlf"])
+        } else if wayland {
+            command("wl-copy", &[])
+        } else if has("powershell.exe") {
+            command("powershell.exe", POWERSHELL)
+        } else {
+            Clipboard::Terminal
         }
-        _ => Clipboard::Terminal,
+    } else if wayland {
+        command("wl-copy", &[])
+    } else if platform.x11 && has("xclip") {
+        command("xclip", &["-selection", "clipboard"])
+    } else {
+        Clipboard::Terminal
     }
 }
 
@@ -207,7 +231,6 @@ mod tests {
         };
         assert_eq!(program(choose(mac, all)).trim(), "pbcopy");
         assert_eq!(program(choose(mac, |p| p == "pbcopy")).trim(), "pbcopy");
-        assert_eq!(program(choose(wsl, all)).trim(), "clip.exe");
         assert_eq!(program(choose(wayland, all)).trim(), "wl-copy");
         assert_eq!(program(choose(x11, all)), "xclip -selection clipboard");
         assert_eq!(
@@ -222,6 +245,193 @@ mod tests {
             Clipboard::Terminal,
             "over ssh"
         );
+    }
+
+    #[test]
+    fn under_wsl_never_clip_exe_but_win32yank_then_wslgs_wl_copy_then_powershell_in_utf_8() {
+        let program = |c: &Clipboard| match c {
+            Clipboard::Command { program, .. } => program.clone(),
+            Clipboard::Terminal => "OSC 52".into(),
+        };
+        // WSL, with WSLg's displays: every program there.
+        let wslg = Platform {
+            wsl: true,
+            wayland: true,
+            x11: true,
+            ..Default::default()
+        };
+        let plain = Platform {
+            wayland: false,
+            ..wslg
+        };
+        let all = |_: &str| true;
+        let only = |there: &'static [&'static str]| move |p: &str| there.contains(&p);
+        for platform in [wslg, plain] {
+            let chosen = choose(platform, all);
+            assert_ne!(program(&chosen), "clip.exe", "{platform:?}");
+            assert_eq!(
+                chosen,
+                Clipboard::Command {
+                    program: "win32yank.exe".into(),
+                    args: vec!["-i".into(), "--crlf".into()]
+                },
+                "{platform:?}"
+            );
+            // Nor with clip.exe the only one there.
+            assert_eq!(
+                choose(platform, only(&["clip.exe"])),
+                Clipboard::Terminal,
+                "{platform:?}"
+            );
+        }
+        // No win32yank: under WSLg wl-copy, else PowerShell.
+        let no_yank = only(&["clip.exe", "wl-copy", "powershell.exe", "xclip"]);
+        assert_eq!(program(&choose(wslg, no_yank)), "wl-copy");
+        assert_eq!(program(&choose(plain, no_yank)), "powershell.exe");
+        // Only PowerShell: the command sets UTF-8 on its input.
+        for platform in [wslg, plain] {
+            let Clipboard::Command { program, args } =
+                choose(platform, only(&["clip.exe", "powershell.exe"]))
+            else {
+                panic!("PowerShell under {platform:?}");
+            };
+            assert_eq!(program, "powershell.exe");
+            assert_eq!(args, POWERSHELL);
+        }
+        // None of the three: the terminal, never xclip or clip.exe.
+        for platform in [wslg, plain] {
+            let none = only(&["clip.exe", "xclip"]);
+            assert_eq!(choose(platform, none), Clipboard::Terminal, "{platform:?}");
+            assert_eq!(choose(platform, |_| false), Clipboard::Terminal);
+        }
+    }
+
+    /// Runs `program` as [`run`] does, again while the system says the
+    /// stand-in just written is busy (another test's fork may hold it open
+    /// for a moment on Linux).
+    #[cfg(unix)]
+    fn run_fresh(program: &str, args: &[String], text: &str) -> Result<(), String> {
+        let start = Instant::now();
+        loop {
+            match run(program, args, text, LIMIT) {
+                Err(e) if e.contains("os error 26") && start.elapsed() < LIMIT => {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// The fix's row. On WSL-shaped environments, the helper chosen is never
+    /// `clip.exe`, and what reaches its standard input is the title's UTF-8
+    /// bytes, unchanged; PowerShell's leg is told to read them as UTF-8. The
+    /// helpers are stand-ins in this test's own folder, each recording its
+    /// input and arguments: the real clipboard is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn under_wsl_the_chosen_helper_is_never_clip_exe_and_gets_the_titles_utf_8_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("wsl-helpers");
+        let helpers = [
+            "win32yank.exe",
+            "wl-copy",
+            "powershell.exe",
+            "clip.exe",
+            "xclip",
+        ];
+        for name in helpers {
+            let path = dir.join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncat > \"$(dirname \"$0\")/{name}.in\"\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/{name}.args\"\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let wslg = Platform {
+            wsl: true,
+            wayland: true,
+            x11: true,
+            ..Default::default()
+        };
+        let plain = Platform {
+            wayland: false,
+            ..wslg
+        };
+        let title = "복사 하기 — pay rent\n장보기";
+        // (where, which helpers are there, the one it must take)
+        let rows: [(Platform, &[&str], &str); 5] = [
+            (wslg, &helpers, "win32yank.exe"),
+            (plain, &helpers, "win32yank.exe"),
+            (
+                wslg,
+                &["wl-copy", "powershell.exe", "clip.exe", "xclip"],
+                "wl-copy",
+            ),
+            (
+                wslg,
+                &["powershell.exe", "clip.exe", "xclip"],
+                "powershell.exe",
+            ),
+            (
+                plain,
+                &["powershell.exe", "clip.exe", "xclip"],
+                "powershell.exe",
+            ),
+        ];
+        for (platform, there, want) in rows {
+            for name in helpers {
+                let _ = fs::remove_file(dir.join(format!("{name}.in")));
+            }
+            let chosen = choose(platform, |p| there.contains(&p));
+            let Clipboard::Command { program, args } = chosen else {
+                panic!("{platform:?} with {there:?}: {chosen:?}");
+            };
+            assert_ne!(program, "clip.exe", "{platform:?} with {there:?}");
+            assert_eq!(program, want, "{platform:?} with {there:?}");
+
+            let helper = dir.join(&program).display().to_string();
+            assert_eq!(run_fresh(&helper, &args, title), Ok(()), "{program}");
+            assert_eq!(
+                fs::read(dir.join(format!("{program}.in"))).unwrap(),
+                title.as_bytes(),
+                "{program}: the title's UTF-8 bytes, unchanged"
+            );
+            assert!(!dir.join("clip.exe.in").exists(), "clip.exe never ran");
+
+            let got = fs::read_to_string(dir.join(format!("{program}.args"))).unwrap();
+            if program == "powershell.exe" {
+                // The one place the encoding could go wrong again: the
+                // input set to UTF-8, before the read, in what it was run
+                // with.
+                let set = "[Console]::InputEncoding=[Text.Encoding]::UTF8;";
+                let read = "[Console]::In.ReadToEnd()";
+                let script = got.lines().nth(3).unwrap_or_default();
+                assert_eq!(
+                    got.lines().take(3).collect::<Vec<_>>(),
+                    ["-NoProfile", "-NonInteractive", "-Command"],
+                    "{got}"
+                );
+                assert!(script.starts_with(set), "{got}");
+                assert!(script.find(set) < script.find(read), "{got}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn powershells_arguments_set_its_input_to_utf_8_before_reading_it() {
+        let ["-NoProfile", "-NonInteractive", "-Command", script] = POWERSHELL else {
+            panic!("{POWERSHELL:?}");
+        };
+        let set = "[Console]::InputEncoding=[Text.Encoding]::UTF8;";
+        let read = "Set-Clipboard -Value ([Console]::In.ReadToEnd())";
+        assert!(script.starts_with(set), "{script}");
+        assert!(script.contains(read), "{script}");
+        assert!(script.find(set) < script.find(read), "{script}");
     }
 
     #[test]

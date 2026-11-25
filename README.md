@@ -127,9 +127,11 @@ it and leaves the words, and a second `esc` leaves typing. Another `//`, or the 
 back in, opens it again. On a screen under 10
 rows, there's no calendar, and the row above the footer says to type the date.
 
-`y` copies with the platform's own command when there is one (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux,
-`clip.exe` under WSL), and else sends the title to the terminal's clipboard with its OSC 52 sequence; the row above
-the footer says which, and whether the command failed. Not every terminal takes OSC 52, and some pass it on only
+`y` copies with the platform's own command when there is one (`pbcopy` on macOS, `wl-copy` or `xclip` on Linux;
+under WSL `win32yank.exe` when it's on `PATH`, else `wl-copy` under WSLg, else `powershell.exe` told to read the
+title as UTF-8, so Hangul comes through whole), and else sends the title to the terminal's clipboard with its OSC 52
+sequence; the row above the footer says which, and whether the command failed. Under WSL it never uses `clip.exe`,
+which reads in the console's code page and garbles Hangul. Not every terminal takes OSC 52, and some pass it on only
 when told to: zellij passes it on, and tarae's own terminal pane drops it for now.
 
 Sub items show under their card, `◦` open and `●` done, and the card counts them (`2/4`). In Done they're folded
